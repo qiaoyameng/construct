@@ -45,6 +45,104 @@ def test_bytewise():
     common(Bitwise(Sequence(Nibble, Bytewise(Int24ub), Nibble)), b"\xf0\x10\x20\x3f", [0x0f,0x010203,0x0f], 4)
     common(Bitwise(Bytewise(GreedyBytes)), bytes(10), bytes(10), SizeofError)
 
+def test_bitwise_seeking():
+    # Tell and Seek use logical bit positions
+    d = Bitwise(Struct(
+        "a" / BitsInteger(4),
+        "t1" / Tell,
+        "b" / BitsInteger(12),
+        "t2" / Tell,
+    ))
+    assert d.parse(b"\xab\xcd") == Container(a=0xa,t1=4,b=0xbcd,t2=16)
+
+    d = Bitwise(Struct(
+        Seek(12),
+        "a" / BitsInteger(4),
+    ))
+    assert d.parse(b"\xab\xcd") == Container(a=0xd)
+
+    # Pointer jumps forth and back at unaligned bit positions
+    d = Bitwise(Struct(
+        "a" / BitsInteger(4),
+        "p" / Pointer(9, BitsInteger(6)),
+        "b" / BitsInteger(4),
+        "c" / BitsInteger(8),
+    ))
+    assert d.parse(bytes([0b10100110,0b01111001])) == Container(a=0b1010,p=0b111100,b=0b0110,c=0b01111001)
+
+    # negative Pointer offsets are relative to the end of the stream
+    d = Bitwise(Struct(
+        "a" / BitsInteger(8),
+        "last" / Pointer(-8, BitsInteger(8)),
+    ))
+    assert d.parse(b"\x01\x02") == Container(a=1,last=2)
+
+    # parse/build symmetry
+    d = Bitwise(Struct(
+        "a" / BitsInteger(8),
+        "p" / Pointer(16, BitsInteger(8)),
+        "b" / BitsInteger(8),
+    ))
+    obj = Container(a=1,p=3,b=2)
+    assert d.build(obj) == b"\x01\x02\x03"
+    assert d.parse(b"\x01\x02\x03") == obj
+    assert d.parse(d.build(obj)) == obj
+    assert d.build(d.parse(b"\x01\x02\x03")) == b"\x01\x02\x03"
+
+    # short reads at the end boundary raise StreamError
+    assert raises(Bitwise(Bytes(12)).parse, b"\x01") == StreamError
+    assert raises(Bitwise(Bytes(8)).parse, b"") == StreamError
+    assert Bitwise(Bytes(8)).parse(b"\x01") == b"\x00"*7 + b"\x01"
+
+    # seeking works inside Bytewise too, in logical byte units
+    d = Bitwise(Bytewise(Struct(
+        "a" / Byte,
+        "t" / Tell,
+        "p" / Pointer(0, Byte),
+        "b" / Byte,
+    )))
+    assert d.parse(b"\x01\x02") == Container(a=1,t=1,p=1,b=2)
+
+    # the outer stream position is restored when leaving the Bitwise context
+    d = Struct(
+        "bits" / Bitwise(Struct(Seek(8), "a"/BitsInteger(8))),
+        "byte" / Byte,
+    )
+    assert d.parse(b"\xab\xcd\xef") == Container(bits=Container(a=0xcd),byte=0xef)
+
+def test_bitwise_bytewise_unaligned():
+    # Bytewise at an unaligned bit position processes the following bits as declared, no padding is inserted
+    d = Bitwise(Struct(
+        "a" / BitsInteger(4),
+        "b" / Bytewise(Byte),
+        "c" / BitsInteger(4),
+    ))
+    common(d, b"\xab\xcd", Container(a=0xa,b=0xbc,c=0xd), 2)
+
+    # a total that does not align to whole bytes is rejected, not zero-padded
+    d = Bitwise(Struct(
+        "a" / BitsInteger(4),
+        "b" / Bytewise(Byte),
+    ))
+    assert raises(d.parse, b"\xab\xcd") == ValueError
+    assert raises(d.build, dict(a=1,b=2)) == ValueError
+
+    # unaligned positions in write mode are rejected explicitly
+    d = Bitwise(Struct(
+        "a" / BitsInteger(4),
+        "p" / Pointer(2, BitsInteger(4)),
+    ))
+    assert raises(d.build, dict(a=1,p=1)) == StreamError
+
+def test_restreamed_variable_ratio_not_seekable():
+    # variable-length (de)compression-style codecs are not fixed-ratio, so the stream
+    # falls back to a non-seekable implementation and Seek fails explicitly
+    stripzeros = lambda b: b.replace(b"\x00", b"")
+    d = Restreamed(Bytes(2), stripzeros, 1, ident, 1, None)
+    assert d.parse(b"\x01\x02") == b"\x01\x02"
+    d = Restreamed(Struct(Seek(1), "a"/Byte), stripzeros, 1, ident, 1, None)
+    assert raises(d.parse, b"\x01\x02") == StreamError
+
 def test_ints():
     common(Byte, b"\xff", 255, 1)
     common(Short, b"\x00\xff", 255, 2)

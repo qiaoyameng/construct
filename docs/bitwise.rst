@@ -49,7 +49,7 @@ Important notes
 
 * ``BitStruct``'s are non-nestable (because ``Bitwise`` are not nestable) so writing something like ``BitStruct(BitStruct(Octet))`` will not work. You can use regular ``Struct`` inside ``BitStruct`` .
 * Byte aligned - The total size of the elements of a ``BitStruct`` must be a multiple of 8 (due to alignment issues). ``RestreamedBytesIO`` will raise an error if the amount of bits and bytes does not align properly.
-* ``GreedyRange``, ``Pointer`` and any ``Lazy*`` - Do not place fields that do seeking/telling or lazy parsing inside ``Bitwise``, because ``RestreamedBytesIO`` offsets will turn out wrong, have unknown side-effects or raise unknown exceptions.
+* ``Pointer``, ``Seek`` and ``Tell`` - These can be used inside ``Bitwise`` when the underlying stream is seekable, with positions expressed in logical bits. Variable-length (de)compression codecs are not supported, and lazy parsing classes may still misbehave.
 * Normal (byte-oriented) classes like ``Int*`` or ``Float*`` can be used by wrapping in ``Bytewise``. If you need to mix byte- and bit-oriented fields, you should use a ``BitStruct`` and ``Bytewise`` .
 * Advanced classes like tunneling may not work in bitwise context. Only basic fields like integers were throughly tested.
 

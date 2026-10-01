@@ -163,6 +163,7 @@ __all__ = [
     'RestreamData',
     'Restreamed',
     'RestreamedBytesIO',
+    'SeekableRestreamedBytesIO',
     'RotationError',
     'Seek',
     'Select',

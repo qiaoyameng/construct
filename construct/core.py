@@ -1035,6 +1035,8 @@ def Bitwise(subcon):
     
     Note that by default the bit ordering is from MSB to LSB for every byte (ie. bit-level big-endian). If you need it reversed, wrap this subcon with :class:`construct.core.BitsSwapped`.
 
+    If the underlying stream is seekable, seeking/telling classes (like Tell Seek Pointer) can be used inside, with positions expressed in logical bits.
+
     :param subcon: Construct instance, any field that works with bits (like BitsInteger) or is bit-byte agnostic (like Struct or Flag)
 
     See :class:`~construct.core.Transformed` and :class:`~construct.core.Restreamed` for raisable exceptions.
@@ -1061,11 +1063,7 @@ def Bitwise(subcon):
         b'\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00'
     """
 
-    try:
-        size = subcon.sizeof()
-        macro = Transformed(subcon, bytes2bits, size//8, bits2bytes, size//8)
-    except SizeofError:
-        macro = Restreamed(subcon, bytes2bits, 1, bits2bytes, 8, lambda n: n//8)
+    macro = Restreamed(subcon, bytes2bits, 1, bits2bytes, 8, lambda n: n//8)
     def _emitseq(ksy, bitwise):
         return subcon._compileseq(ksy, bitwise=True)
     def _emitprimitivetype(ksy, bitwise):
@@ -1084,6 +1082,8 @@ def Bytewise(subcon):
 
     Parsing building and size are deferred to subcon, although size gets multiplied by 8.
 
+    Note that when entering at a bit position that is not a multiple of 8, the subcon simply processes the following bits as declared (no padding is inserted), and the enclosing Bitwise context will fail on exit if the total does not align to whole bytes.
+
     :param subcon: Construct instance, any field that works with bytes or is bit-byte agnostic
 
     See :class:`~construct.core.Transformed` and :class:`~construct.core.Restreamed` for raisable exceptions.
@@ -1101,11 +1101,7 @@ def Bytewise(subcon):
         5
     """
 
-    try:
-        size = subcon.sizeof()
-        macro = Transformed(subcon, bits2bytes, size*8, bytes2bits, size*8)
-    except SizeofError:
-        macro = Restreamed(subcon, bits2bytes, 8, bytes2bits, 1, lambda n: n*8)
+    macro = Restreamed(subcon, bits2bytes, 8, bytes2bits, 1, lambda n: n*8)
     def _emitseq(ksy, bitwise):
         return subcon._compileseq(ksy, bitwise=False)
     def _emitprimitivetype(ksy, bitwise):
@@ -5309,7 +5305,7 @@ class Restreamed(Subconstruct):
 
     .. warning:: Remember that subcon must consume or produce an amount of bytes that is a multiple of encoding or decoding units. For example, in a Bitwise context you should process a multiple of 8 bits or the stream will fail during parsing/building.
 
-    .. warning:: Do NOT use seeking/telling classes inside Restreamed context.
+    .. warning:: Seeking/telling classes (like Pointer and Seek) can be used inside Restreamed context only if the underlying stream is seekable and the codec is fixed-ratio (like Bitwise and Bytewise are), in which case positions are expressed in logical (decoded) units. Variable-length (de)compression codecs are not supported, and seeking there raises StreamError.
 
     :param subcon: Construct instance
     :param decoder: bytes-to-bytes function, used on data chunks when parsing
@@ -5335,17 +5331,29 @@ class Restreamed(Subconstruct):
         self.encoderunit = encoderunit
         self.sizecomputer = sizecomputer
 
+    def _makestream(self, stream):
+        try:
+            seekable = stream.seekable()
+        except Exception:
+            seekable = False
+        if seekable:
+            try:
+                return SeekableRestreamedBytesIO(stream, self.decoder, self.decoderunit, self.encoder, self.encoderunit)
+            except Exception:
+                pass
+        return RestreamedBytesIO(stream, self.decoder, self.decoderunit, self.encoder, self.encoderunit)
+
     def _parse(self, stream, context, path):
-        stream2 = RestreamedBytesIO(stream, self.decoder, self.decoderunit, self.encoder, self.encoderunit)
+        stream2 = self._makestream(stream)
         obj = self.subcon._parsereport(stream2, context, path)
         stream2.close()
         return obj
 
     def _build(self, obj, stream, context, path):
-        stream2 = RestreamedBytesIO(stream, self.decoder, self.decoderunit, self.encoder, self.encoderunit)
+        stream2 = self._makestream(stream)
         buildret = self.subcon._build(obj, stream2, context, path)
         stream2.close()
-        return obj
+        return buildret
 
     def _sizeof(self, context, path):
         if self.sizecomputer is None:
