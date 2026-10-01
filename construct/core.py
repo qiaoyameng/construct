@@ -258,6 +258,132 @@ class BytesIOWithOffsets(io.BytesIO):
         return self.tell()
 
 
+class BoundedStream(io.RawIOBase):
+    r"""
+    Read-only, length-bounded window into another stream.
+
+    Used by :class:`~construct.core.Prefixed` in streaming mode so the subcon
+    can be parsed directly from a (possibly large, non-seekable) parent stream
+    without buffering the whole prefixed payload into memory.
+
+    The window starts at the parent stream's current position and spans
+    ``length`` bytes. The subcon sees its own zero-based coordinates (its
+    own zero at the section start via :meth:`tell`) and its own EOF at
+    ``length``: neither reads nor seeks can cross either boundary. Note that
+    this differs from the buffered mode (using :class:`BytesIOWithOffsets`)
+    where reported offsets are absolute relative to the parent stream; in
+    streaming mode the section is treated as its own stream.
+
+    The parent stream must be tellable. If it is seekable, the window supports
+    arbitrary seeks inside the window and the parent can be repositioned after
+    parsing. If it is not seekable, only forward reads and relative forward
+    seeks (skipping) are supported; unconsumed bytes are drained explicitly by
+    the owning construct after the subcon parsed successfully.
+    """
+
+    def __init__(self, parent_stream, length: int, path: str):
+        if length < 0:
+            raise StreamError("length must be non-negative, found %s" % length, path=path)
+        self.parent_stream = parent_stream
+        self.parent_stream_offset = stream_tell(parent_stream, path)
+        self.length = length
+        self.position = 0
+        self.path = path
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return False
+
+    def seekable(self):
+        try:
+            return self.parent_stream.seekable()
+        except Exception:
+            return False
+
+    def tell(self) -> int:
+        return self.position
+
+    def read(self, size=-1):
+        if self.position >= self.length:
+            return b""
+        if size is None or size < 0:
+            size = self.length - self.position
+        size = min(size, self.length - self.position)
+        if size <= 0:
+            return b""
+        parts = []
+        remaining = size
+        while remaining > 0:
+            try:
+                data = self.parent_stream.read(remaining)
+            except Exception:
+                raise StreamError("stream.read() failed, requested %s bytes" % (remaining,), path=self.path)
+            if not data:
+                break
+            parts.append(data)
+            remaining -= len(data)
+            self.position += len(data)
+        return b"".join(parts)
+
+    def readinto(self, buffer):
+        data = self.read(len(buffer))
+        count = len(data)
+        buffer[:count] = data
+        return count
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            target = offset
+        elif whence == io.SEEK_CUR:
+            target = self.position + offset
+        elif whence == io.SEEK_END:
+            target = self.length + offset
+        else:
+            raise StreamError("invalid whence %s" % (whence,), path=self.path)
+        if target < 0:
+            raise StreamError(
+                "seek before beginning of prefixed substream, "
+                "target position %d, length %d" % (target, self.length),
+                path=self.path)
+        if target > self.length:
+            raise StreamError(
+                "seek past end of prefixed substream, "
+                "target position %d, length %d" % (target, self.length),
+                path=self.path)
+        delta = target - self.position
+        if delta < 0:
+            try:
+                self.parent_stream.seek(
+                    self.parent_stream_offset + target, io.SEEK_SET)
+            except Exception:
+                raise StreamError(
+                    "parent stream is not seekable, cannot seek backwards "
+                    "within prefixed substream (from %d to %d)"
+                    % (self.position, target), path=self.path)
+        elif delta > 0:
+            try:
+                self.parent_stream.seek(delta, io.SEEK_CUR)
+            except Exception:
+                self._drain(delta)
+        self.position += delta
+        return self.tell()
+
+    def _drain(self, amount: int):
+        while amount > 0:
+            data = self.parent_stream.read(min(amount, 1024*1024))
+            if not data:
+                raise StreamError(
+                    "stream read less than specified amount, "
+                    "could not skip %d bytes" % amount, path=self.path)
+            amount -= len(data)
+
+    def drain_remaining(self):
+        self._drain(self.length - self.position)
+        self.position = self.length
+
+
 class CodeGen:
     def __init__(self):
         self.blocks = []
@@ -4872,6 +4998,45 @@ class Prefixed(Subconstruct):
     :param lengthfield: Construct instance, field used for storing the length
     :param subcon: Construct instance, subcon used for storing the value
     :param includelength: optional, bool, whether length field should include its own size, default is False
+    :param streaming: optional, bool, when True the subcon is parsed directly from the parent stream through a length-bounded window instead of first buffering the whole payload into memory, default is False
+
+    When ``streaming=False`` (default), the whole prefixed payload is read
+    into memory and the subcon parses a new in-memory stream, regardless of
+    whether the parent stream is seekable.
+
+    When ``streaming=True``, the subcon parses directly from the parent
+    stream through a bounded window: it sees its own zero at the beginning
+    of the prefixed section and its own EOF at the declared length; reads
+    and seeks cannot cross either boundary. This keeps memory usage low for
+    payloads of hundreds of megabytes or more. Note that positions reported
+    to the subcon (via :class:`Tell` or context) are relative to the
+    section, not the parent stream; this differs from the buffered mode
+    which reports parent-absolute positions.
+
+    Parent stream position after parsing:
+
+    * Subcon finishes early (leaves unconsumed bytes): parent is positioned
+      at the end of the prefixed section, so the following field lines up.
+      On a seekable stream the window is seeked forward; on a non-seekable
+      stream the remaining bytes are drained.
+    * Subcon fails: exception propagates. A seekable parent is left at the
+      end of the section; a non-seekable parent is left where the subcon
+      stopped (it can neither rewind nor skip bytes that may have caused
+      the failure).
+    * Subcon returns a lazy reference (:class:`Lazy`, lazy fields inside
+      :class:`LazyStruct`): it captures a window into the parent stream and
+      remains usable afterwards. This requires a seekable, tellable parent.
+
+    Supported stream types: the parent stream must be tellable. Seekable
+    streams (files, BytesIO) support everything, including greedy and
+    back-seeking constructs. Non-seekable streams (pipes, sockets) support
+    forward-only constructs; subcons that need to seek backwards (e.g.
+    :class:`GreedyRange` rolling back after a failed element) and lazy
+    references are not supported and raise :class:`StreamError` when they
+    attempt to seek back.
+
+    Note: compiled parsing always uses the buffered behavior regardless of
+    this flag.
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
 
@@ -4886,15 +5051,41 @@ class Prefixed(Subconstruct):
         [1684234849, 1751606885]
     """
 
-    def __init__(self, lengthfield, subcon, includelength=False):
+    def __init__(self, lengthfield, subcon, includelength=False, streaming=False):
         super().__init__(subcon)
         self.lengthfield = lengthfield
         self.includelength = includelength
+        self.streaming = streaming
 
     def _parse(self, stream, context, path):
         length = self.lengthfield._parsereport(stream, context, path)
         if self.includelength:
             length -= self.lengthfield._sizeof(context, path)
+        if self.streaming:
+            start = stream_tell(stream, path)
+            substream = BoundedStream(stream, length, path)
+            try:
+                seekable = stream.seekable()
+            except Exception:
+                seekable = False
+            try:
+                obj = self.subcon._parsereport(substream, context, path)
+            except Exception:
+                # Parent ends up at the last byte the subcon attempted to
+                # read. On a seekable parent, move it to the end of the
+                # prefixed section so the following field is not misaligned;
+                # a non-seekable parent cannot be rewound, so it is left
+                # wherever the failing subcon stopped.
+                end = start + length
+                if seekable:
+                    stream_seek(stream, end, io.SEEK_SET, path)
+                raise
+            end = start + length
+            if seekable:
+                stream_seek(stream, end, io.SEEK_SET, path)
+            else:
+                substream.drain_remaining()
+            return obj
         substream = BytesIOWithOffsets.from_reading(stream, length, path)
         return self.subcon._parsereport(substream, context, path)
 

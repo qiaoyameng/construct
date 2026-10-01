@@ -65,6 +65,44 @@ ListContainer([1684234849, 1751606885])
 >>> d.parse(b"\x02abcdefgh")
 ListContainer([1684234849, 1751606885])
 
+Streaming large payloads
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, ``Prefixed`` reads the entire prefixed payload into memory and
+hands the subcon a new ``BytesIO``. That is convenient but buffers the whole
+section, which is wasteful when the payload is hundreds of megabytes and the
+subcon only needs small pieces (fixed-size headers, element-by-element
+arrays, lazy fields). Pass ``streaming=True`` to parse directly from the
+parent stream through a length-bounded window instead:
+
+>>> d = Struct(
+...     "head" / Prefixed(Int32ub, Struct("magic"/Int32ub), streaming=True),
+...     "next" / Byte,
+...)
+>>> d.parse(b"\x00\x00\x00\x04ABCD\xff")
+Container(head=Container(magic=1094861636), next=255)
+
+Inside the window the subcon sees its own zero (its section start) and its
+own EOF at the declared length; reads and seeks cannot cross either
+boundary. Note that positions reported inside the window (via ``Tell``,
+``Pointer``, contexts) are relative to the section, unlike the default
+buffered mode which reports parent-absolute positions.
+
+After the subcon finishes, the parent stream always ends up at the end of
+the prefixed section so a following field lines up: if the subcon finishes
+early, leftover bytes are seeked over on seekable streams or drained in
+bounded chunks on non-seekable ones. If the subcon fails, the exception
+propagates; a seekable parent is left at the end of the section while a
+non-seekable (pipe/socket) parent is left where the subcon stopped, since it
+can neither rewind nor skip bytes implicated in the failure.
+
+Supported inputs: the parent stream must be tellable. Seekable streams
+(files, ``BytesIO``) support everything, including greedy constructs that
+roll back and lazy references. Non-seekable streams support forward-only
+subcons; constructs that need to seek backwards (for example
+``GreedyRange`` rolling back after a failed trailing element) and lazy
+references raise ``StreamError``.
+
 There are also other means of restricting constructs to substreamed data. All 3 classes below work by substreaming data, meaning the subcon is not given the original stream but a new ``BytesIO`` made out of pre-read bytes. This allows ``Greedy*`` fields to work properly.
 
 ``FixedSized`` consumes a specified amount and then exposes inner construct to a new stream built out of those bytes. When building, it appends a padding to make a specified total.
@@ -271,4 +309,3 @@ Subcons can also be easily encrypted and authenticated in a AEAD manner. Please 
         enc_data = Container: 
             width = 5
             height = 4
-

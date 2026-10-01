@@ -1124,6 +1124,272 @@ def test_prefixed():
     d = Prefixed(Byte, GreedyString("utf-8"))
     common(d, b"\x0a"+bytes(10), u"\x00"*10, SizeofError)
 
+class _RecordingSeekableStream(io.RawIOBase):
+    """Virtual zero stream that records every read() size. Seekable."""
+    def __init__(self, n, lengthfield=Int32ub):
+        self.n = n
+        self.header = lengthfield.build(n)
+        self.lengthfield = lengthfield
+        self.pos = 0
+        self.read_sizes = []
+    def readable(self):
+        return True
+    def seekable(self):
+        return True
+    def tell(self):
+        return self.pos
+    def seek(self, offset, whence=0):
+        end = self.n + len(self.header)
+        if whence == 0: self.pos = offset
+        elif whence == 1: self.pos += offset
+        else: self.pos = end + offset
+        return self.pos
+    def read(self, size=-1):
+        if self.pos < len(self.header):
+            end = len(self.header) if size is None or size < 0 else min(len(self.header), self.pos+size)
+            data = self.header[self.pos:end]
+            self.pos += len(data)
+            self.read_sizes.append(len(data))
+            return data
+        end = self.n + len(self.header)
+        if size is None or size < 0:
+            size = end - self.pos
+        size = max(0, min(size, end-self.pos))
+        self.read_sizes.append(size)
+        self.pos += size
+        return bytes(size)
+
+class _RecordingForwardStream(_RecordingSeekableStream):
+    """Same but non-seekable (pipe/socket-like)."""
+    def seekable(self):
+        return False
+    def seek(self, *args):
+        raise io.UnsupportedOperation
+
+def test_prefixed_streaming_basic_and_boundaries():
+    # greedy subcon inside the window followed by another field, seekable
+    d = Struct(
+        "items" / Prefixed(VarInt, GreedyRange(Int32ul), streaming=True),
+        "tail" / Byte,
+    )
+    assert d.parse(b"\x08abcdefgh\xff") == Container(items=[1684234849,1751606885], tail=255)
+
+    # subcon consumes fewer bytes than declared: parent still ends at section end
+    d = Struct("x"/Prefixed(Byte, Int16ub, streaming=True), "tail"/Byte)
+    assert d.parse(b"\x05\x00\x01aaa\xff") == Container(x=1, tail=255)
+
+    # zero-based section coordinates: Tell and Pointer(0)
+    d = Prefixed(Byte, Struct("pad"/Byte, "pos"/Tell), streaming=True)
+    assert d.parse(b"\x05hello") == Container(pad=104, pos=1)
+    d = Prefixed(VarInt, Struct("b"/Byte, "start"/Pointer(0, Byte)), streaming=True)
+    assert d.parse(b"\x05abccc") == Container(b=97, start=97)
+
+    # reads cannot cross the end boundary: EOF appears right at declared length
+    assert Prefixed(Byte, GreedyBytes, streaming=True).parse(b"\x05hello??") == b"hello"
+
+    # seeks cannot cross either boundary
+    assert raises(
+        Prefixed(Byte, Struct("a"/Byte, Seek(-1)), streaming=True).parse,
+        b"\x05hello",
+    ) == StreamError
+    assert raises(
+        Prefixed(Byte, Struct("a"/Byte, Seek(6)), streaming=True).parse,
+        b"\x05hello",
+    ) == StreamError
+
+    # includelength keeps working in streaming mode
+    d = Struct("x"/Prefixed(Byte, Int16ub, includelength=True, streaming=True), "tail"/Byte)
+    assert d.parse(b"\x03\x00\x01\xff") == Container(x=1, tail=255)
+
+def test_prefixed_streaming_failure_parent_position():
+    # truncated section: subcon reads past available data.
+    # seekable parent -> repositioned to declared end, following field aligns
+    d = Struct(
+        "x" / Prefixed(Byte, Int32ub, streaming=True),
+        "tail" / Byte,
+    )
+    # section declares 4 bytes but only 2 are present before the stream ends
+    stream = io.BytesIO(b"\x04ab")
+    assert raises(d.parse_stream, stream) == StreamError
+    assert stream.tell() == 5
+
+    # non-seekable parent -> left where subcon stopped (cannot rewind)
+    class ShortForward(io.RawIOBase):
+        def __init__(self): self.pos = 0
+        def readable(self): return True
+        def seekable(self): return False
+        def tell(self): return self.pos
+        def read(self, size=-1):
+            data = b"\x04ab"
+            if size is None or size < 0:
+                size = len(data)-self.pos
+            chunk = data[self.pos:min(len(data), self.pos+size)]
+            self.pos += len(chunk)
+            return chunk
+    short = ShortForward()
+    assert raises(
+        Prefixed(Int32ub, Int32ub, streaming=True).parse_stream, short
+    ) == StreamError
+    assert short.pos == 3
+
+def test_prefixed_streaming_nonseekable():
+    # forward-only stream: greedy subcon and trailing field stay aligned
+    d = Struct(
+        "blob" / Prefixed(Byte, GreedyBytes, streaming=True),
+        "tail" / Byte,
+    )
+    stream = _RecordingForwardStream(5)
+    # real data needed for actual content: use custom forward stream instead
+    class ForwardBytes(io.RawIOBase):
+        def __init__(self, data):
+            self.data = data; self.pos = 0; self.read_sizes = []
+        def readable(self): return True
+        def seekable(self): return False
+        def tell(self): return self.pos
+        def read(self, size=-1):
+            if size is None or size < 0:
+                size = len(self.data)-self.pos
+            size = max(0, min(size, len(self.data)-self.pos))
+            self.read_sizes.append(size)
+            data = self.data[self.pos:self.pos+size]
+            self.pos += size
+            return data
+    fb = ForwardBytes(b"\x05hello\xff")
+    assert d.parse_stream(fb) == Container(blob=b"hello", tail=255)
+    assert fb.pos == 7
+
+    # early finish on a forward-only stream: remainder drained, still aligned
+    d = Struct("x"/Prefixed(Byte, Int16ub, streaming=True), "tail"/Byte)
+    fb = ForwardBytes(b"\x05\x00\x01aaa\xff")
+    assert d.parse_stream(fb) == Container(x=1, tail=255)
+    assert fb.pos == 7
+
+    # backward seek from the subcon is rejected on a forward-only parent
+    fb = ForwardBytes(b"\x06abcdef")
+    assert raises(
+        Prefixed(Byte, GreedyRange(Int32ub), streaming=True).parse_stream, fb
+    ) == StreamError
+
+    # lazy reference requires a seekable parent
+    fb = ForwardBytes(b"\x02\x07z\xff")
+    assert raises(
+        Struct("p"/Lazy(Prefixed(Byte, Byte, streaming=True)), "t"/Byte).parse_stream,
+        fb,
+    ) == StreamError
+
+def test_prefixed_streaming_memory_bound():
+    n = 10_000_000
+    subcon = Struct("head"/Int32ub)
+    # buffered mode: whole payload pulled in one read before subcon runs
+    buffered = _RecordingSeekableStream(n)
+    Prefixed(Int32ub, subcon, streaming=False).parse_stream(buffered)
+    assert max(buffered.read_sizes) == n
+    # streaming mode: only the bytes the subcon actually requests
+    streamed = _RecordingSeekableStream(n)
+    Prefixed(Int32ub, subcon, streaming=True).parse_stream(streamed)
+    assert max(streamed.read_sizes) <= 4
+    assert streamed.pos == n + 4
+    # forward-only: remainder drained in bounded chunks, still aligned
+    forward = _RecordingForwardStream(n)
+    Prefixed(Int32ub, subcon, streaming=True).parse_stream(forward)
+    assert forward.pos == n + 4
+    assert max(forward.read_sizes) <= 1024*1024
+
+def test_prefixed_streaming_lazy():
+    # Lazy field inside a streaming Prefixed, followed by another field
+    d = Struct(
+        "p" / Prefixed(Byte, Struct("a"/Byte, "b"/Lazy(Int16ub)), streaming=True),
+        "tail" / Byte,
+    )
+    result = d.parse(b"\x03\x01\x00\x02\xff")
+    assert result.p.a == 1
+    assert result.tail == 255
+    assert result.p.b() == 2
+
+    # LazyStruct inside streaming Prefixed
+    d = Struct(
+        "box" / Prefixed(Byte, LazyStruct("a"/Byte, "b"/Int16ub), streaming=True),
+        "tail" / Byte,
+    )
+    result = d.parse(b"\x03\x01\x00\x02\xff")
+    assert result.box.a == 1
+    assert result.box.b == 2
+    assert result.tail == 255
+
+def test_prefixed_streaming_nested():
+    d = Struct(
+        "outer" / Prefixed(Byte,
+            Struct("inner"/Prefixed(Byte, Int16ub), "after"/Byte),
+            streaming=True),
+        "tail" / Byte,
+    )
+    data = b"\x05\x02\x01\x02X\x00\xff"
+    result = d.parse(data)
+    assert result.outer.inner == 0x0102
+    assert result.outer.after == ord("X")
+    assert result.tail == 255
+
+    class ForwardBytes(io.RawIOBase):
+        def __init__(self, data):
+            self.data = data; self.pos = 0; self.read_sizes = []
+        def readable(self): return True
+        def seekable(self): return False
+        def tell(self): return self.pos
+        def read(self, size=-1):
+            self.read_sizes.append(size)
+            if size is None or size < 0:
+                size = len(self.data)-self.pos
+            chunk = self.data[self.pos:self.pos+size]
+            self.pos += len(chunk)
+            return chunk
+    forward = ForwardBytes(data)
+    result = d.parse_stream(forward)
+    assert result.outer.inner == 0x0102
+    assert result.outer.after == ord("X")
+    assert result.tail == 255
+    assert forward.pos == len(data)
+    # every read is small; no read ever crosses the section boundary
+    assert all(size <= 2 for size in forward.read_sizes)
+
+def test_prefixed_streaming_following_field_alignment():
+    # subcon reads too little (fixed field in a larger section) and another
+    # subcon consumes its whole section: following fields must line up either way
+    d = Struct(
+        "a" / Prefixed(Byte, Byte, streaming=True),
+        "b" / Prefixed(Byte, GreedyRange(Byte), streaming=True),
+        "c" / Byte,
+    )
+    data = b"\x04wxyz\x03pqr\xff"
+    assert d.parse(data) == Container(
+        a=ord("w"), b=[ord(c) for c in "pqr"], c=255)
+
+    class ForwardBytes(io.RawIOBase):
+        def __init__(self, data):
+            self.data = data; self.pos = 0
+        def readable(self): return True
+        def seekable(self): return False
+        def tell(self): return self.pos
+        def read(self, size=-1):
+            if size is None or size < 0:
+                size = len(self.data)-self.pos
+            chunk = self.data[self.pos:self.pos+size]
+            self.pos += len(chunk)
+            return chunk
+    forward = ForwardBytes(data)
+    assert d.parse_stream(forward) == Container(
+        a=ord("w"), b=[ord(c) for c in "pqr"], c=255)
+    assert forward.pos == len(data)
+
+    # many sequential streaming-prefixed fields stay aligned
+    d2 = Struct(
+        "items" / Array(20, Prefixed(VarInt, Byte, streaming=True)),
+        "end" / Byte,
+    )
+    data2 = b"".join(b"\x01" + bytes([0x40+i]) for i in range(20)) + b"\xff"
+    result2 = d2.parse(data2)
+    assert len(result2.items) == 20
+    assert result2.end == 255
+
 def test_prefixedarray():
     common(PrefixedArray(Byte,Byte), b"\x02\x0a\x0b", [10,11], SizeofError)
     assert PrefixedArray(Byte, Byte).parse(b"\x03\x01\x02\x03") == [1,2,3]
