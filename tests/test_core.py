@@ -1610,6 +1610,97 @@ def test_exprvalidator():
     assert raises(One.build, 255) == ValidationError
     assert One.sizeof() == 1
 
+def test_fixedpoint():
+    from decimal import Decimal
+
+    # scale=0.1 offset=-40 over signed 16 bits, raw in [-32768, 32767]
+    # boundary byte samples computed independently with integer/Fraction math:
+    # raw -32768 -> 0x8000 -> -32768*0.1-40 = -3316.8
+    # raw -32767 -> 0x8001 -> -3316.7
+    # raw    400 -> 0x0190 -> 0
+    # raw  32767 -> 0x7fff -> 3236.7
+    d = FixedPoint(Int16sb, "0.1", "-40")
+    common(d, b"\x80\x00", Decimal("-3316.8"), 2)
+    common(d, b"\x80\x01", Decimal("-3316.7"), 2)
+    common(d, b"\x01\x90", Decimal("0"), 2)
+    common(d, b"\x7f\xff", Decimal("3236.7"), 2)
+    assert isinstance(d.parse(b"\x80\x00"), Decimal)
+
+    # half a quantization unit (0.05) around the minimum negative raw value:
+    # -3316.75 -> raw -32767.5 (tie, floor is even) ; -3316.65 -> raw -32766.5 (tie, floor is odd)
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="half_even").build(Decimal("-3316.75")) == b"\x80\x00"
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="half_up").build(Decimal("-3316.75")) == b"\x80\x00"
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="half_down").build(Decimal("-3316.75")) == b"\x80\x01"
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="half_even").build(Decimal("-3316.65")) == b"\x80\x02"
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="half_up").build(Decimal("-3316.65")) == b"\x80\x01"
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="half_down").build(Decimal("-3316.65")) == b"\x80\x02"
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="floor").build(Decimal("-3316.65")) == b"\x80\x01"
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="ceil").build(Decimal("-3316.65")) == b"\x80\x02"
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="down").build(Decimal("-3316.65")) == b"\x80\x02"
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="up").build(Decimal("-3316.65")) == b"\x80\x01"
+    # positive tie: 3236.65 -> raw 32766.5
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="half_even").build(Decimal("3236.65")) == b"\x7f\xfe"
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="half_up").build(Decimal("3236.65")) == b"\x7f\xff"
+    # decimal module constant names are accepted too
+    assert FixedPoint(Int16sb, "0.1", "-40", rounding="ROUND_HALF_EVEN").build(Decimal("-3316.65")) == b"\x80\x02"
+
+    # exact decimal tie that binary floats get wrong: 1.005/0.01 = 100.5 exactly
+    assert FixedPoint(Int16sb, "0.01", rounding="half_even").build(Decimal("1.005")) == b"\x00\x64"
+    assert FixedPoint(Int16sb, "0.01", rounding="half_up").build(Decimal("1.005")) == b"\x00\x65"
+
+    # non-binary scale and non-terminating quotient (unrepresentable precision):
+    # scale=3 offset=1, raw -2 -> 0xfe -> -5 ; value -4.5 -> raw -11/6
+    d = FixedPoint(Int8sb, 3, 1)
+    common(d, b"\xfe", Decimal(-5), 1)
+    assert FixedPoint(Int8sb, 3, 1, rounding="floor").build(Decimal("-4.5")) == b"\xfe"
+    assert FixedPoint(Int8sb, 3, 1, rounding="ceil").build(Decimal("-4.5")) == b"\xff"
+    assert FixedPoint(Int8sb, 3, 1, rounding="half_even").build(Decimal("-4.5")) == b"\xfe"
+
+    # overflow handling near the minimum negative raw value
+    assert raises(FixedPoint(Int16sb, "0.1", "-40").build, Decimal("-3316.9")) == AdaptationError
+    assert raises(FixedPoint(Int16sb, "0.1", "-40").build, Decimal("3236.8")) == AdaptationError
+    assert FixedPoint(Int16sb, "0.1", "-40", onoverflow="saturate").build(Decimal("-4000")) == b"\x80\x00"
+    assert FixedPoint(Int16sb, "0.1", "-40", onoverflow="saturate").build(Decimal("4000")) == b"\x7f\xff"
+    # wrap: raw 32768 -> -32768 (0x8000), raw 32769 -> -32767 (0x8001), raw -32769 -> 32767 (0x7fff)
+    assert FixedPoint(Int16sb, "0.1", "-40", onoverflow="wrap").build(Decimal("3236.8")) == b"\x80\x00"
+    assert FixedPoint(Int16sb, "0.1", "-40", onoverflow="wrap").build(Decimal("3236.9")) == b"\x80\x01"
+    assert FixedPoint(Int16sb, "0.1", "-40", onoverflow="wrap").build(Decimal("-3316.9")) == b"\x7f\xff"
+
+    # NaN and Infinity are rejected, floats are rejected to avoid precision loss
+    assert raises(d.build, Decimal("NaN")) == AdaptationError
+    assert raises(d.build, Decimal("Infinity")) == AdaptationError
+    assert raises(d.build, Decimal("-Infinity")) == AdaptationError
+    assert raises(d.build, 1.5) == AdaptationError
+    assert raises(FixedPoint, Int16sb, 0.1) == AdaptationError
+    assert raises(FixedPoint, Int16sb, "0") == AdaptationError
+    assert raises(FixedPoint, Int16sb, "NaN") == AdaptationError
+    assert raises(FixedPoint, Int16sb, "0.1", "Infinity") == AdaptationError
+    assert raises(FixedPoint, Int16sb, "0.1", rounding="truncate") == AdaptationError
+    assert raises(FixedPoint, Int16sb, "0.1", onoverflow="clamp") == AdaptationError
+
+    # scale, offset and bits can come from the context; sizeof does no conversion
+    st = Struct(
+        "scale" / Int8ub,
+        "offset" / Int8sb,
+        "bits" / Int8ub,
+        "value" / FixedPoint(Int16sb, this.scale, this.offset, this.bits),
+    )
+    common(st, b"\x0a\x01\x10\x01\x90", Container(scale=10, offset=1, bits=16, value=Decimal(4001)), 5)
+    assert st.sizeof() == 5
+
+    # explicit bits parameter controls the range check
+    assert raises(FixedPoint(Int16sb, 1, bits=8).build, 128) == AdaptationError
+    assert FixedPoint(Int16sb, 1, bits=8, onoverflow="saturate").build(128) == b"\x00\x7f"
+    assert FixedPoint(Int16sb, 1, bits=8, onoverflow="saturate").build(-129) == b"\xff\x80"
+
+    # compiled construct behaves identically
+    d = FixedPoint(Int16sb, "0.1", "-40")
+    c = d.compile()
+    assert c.parse(b"\x80\x00") == Decimal("-3316.8")
+    assert c.build(Decimal("-3316.75")) == d.build(Decimal("-3316.75"))
+    assert raises(c.build, Decimal("NaN")) == AdaptationError
+    assert c.sizeof() == 2
+
 def test_ipaddress_adapter_issue_95():
     class IpAddressAdapter(Adapter):
         def _encode(self, obj, context, path):

@@ -85,6 +85,7 @@ __all__ = [
     'ExprSymmetricAdapter',
     'ExprValidator',
     'Filter',
+    'FixedPoint',
     'FixedSized',
     'Flag',
     'FlagsEnum',

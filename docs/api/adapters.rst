@@ -5,6 +5,7 @@ Core API: Adapters and Validators
 .. autofunction:: construct.ExprAdapter
 .. autofunction:: construct.ExprSymmetricAdapter
 .. autofunction:: construct.ExprValidator
+.. autofunction:: construct.FixedPoint
 .. autofunction:: construct.OneOf
 .. autofunction:: construct.NoneOf
 .. autofunction:: construct.Filter

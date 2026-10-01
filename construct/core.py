@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-import struct, io, binascii, itertools, collections, pickle, sys, os, hashlib, importlib, importlib.machinery, importlib.util
+import struct, io, binascii, itertools, collections, pickle, sys, os, hashlib, importlib, importlib.machinery, importlib.util, decimal, fractions
 
 from construct.lib import *
 from construct.expr import *
@@ -6315,6 +6315,145 @@ class ExprValidator(Validator):
     def __init__(self, subcon, validator):
         super().__init__(subcon)
         self._validate = lambda obj,ctx,path: validator(obj,ctx)
+
+
+class FixedPoint(Adapter):
+    r"""
+    Adapter for fixed-point telemetry values stored as signed integers. The transmitted value is a raw signed integer of `bits` width, and the semantic value is ``raw * scale + offset``. All math is done with :class:`decimal.Decimal` and :class:`fractions.Fraction`, never with floats, so no precision is lost in either direction.
+
+    Parsing always succeeds and returns a Decimal computed exactly (a sufficiently large local decimal context is used, sized from the actual operands). Building accepts int, str or Decimal values (floats are rejected because they may already have lost precision), quantizes ``(value - offset) / scale`` to an integer using the selected `rounding` mode, and then applies the selected `onoverflow` policy if the integer does not fit into the signed `bits` range. NaN and Infinity are rejected on build, and so are non-finite or zero scales and non-finite offsets.
+
+    Rounding modes (ties are exact rational ties, negative values included): ``half_even`` (ties to even neighbor), ``half_up`` (ties away from zero), ``half_down`` (ties towards zero), ``up`` (away from zero), ``down`` (towards zero), ``floor`` (towards -inf), ``ceil`` (towards +inf). Names may also be given as the decimal module constants, e.g. ``"ROUND_HALF_EVEN"``. The default is ``half_even``, never truncation. Overflow policies: ``error`` (raise AdaptationError, default), ``saturate`` (clamp to the nearest representable raw value), ``wrap`` (reduce modulo 2**bits into the signed range).
+
+    The `scale`, `offset` and `bits` parameters can each be a constant or a context lambda. If `bits` is None, it is inferred from ``subcon.sizeof()`` at build time. Sizeof defers to the subcon and performs no data conversion.
+
+    :param subcon: Construct instance, a signed integer field such as Int16sb
+    :param scale: int, str or Decimal, or context lambda returning one (non-zero, finite)
+    :param offset: int, str or Decimal, or context lambda returning one (finite)
+    :param bits: optional int or context lambda, width of the raw signed integer
+    :param rounding: string, one of half_even half_up half_down up down floor ceil
+    :param onoverflow: string, one of error saturate wrap
+
+    :raises AdaptationError: scale is zero or non-finite, offset is non-finite, a float is passed for scale/offset/value, the build value is NaN or Infinity, the value overflows and onoverflow is "error", or bits cannot be determined
+
+    Example::
+
+        >>> d = FixedPoint(Int16sb, "0.1", "-40")
+        >>> d.parse(b"\\x01\\x00")
+        Decimal("-14.4")
+        >>> d.build(Decimal("-14.4"))
+        b"\\x01\\x00"
+        >>> d.sizeof()
+        2
+    """
+    _ROUNDING_MODES = ("half_even", "half_up", "half_down", "up", "down", "floor", "ceil")
+    _OVERFLOW_MODES = ("error", "saturate", "wrap")
+
+    def __init__(self, subcon, scale, offset=0, bits=None, rounding="half_even", onoverflow="error"):
+        super().__init__(subcon)
+        self.scale = scale
+        self.offset = offset
+        self.bits = bits
+        self.rounding = self._normalize_rounding(rounding)
+        if onoverflow not in self._OVERFLOW_MODES:
+            raise AdaptationError("onoverflow must be one of: %s" % (", ".join(self._OVERFLOW_MODES),))
+        self.onoverflow = onoverflow
+        if not callable(scale):
+            if self._to_decimal(scale, "scale") == 0:
+                raise AdaptationError("scale must be non-zero")
+        if not callable(offset):
+            self._to_decimal(offset, "offset")
+
+    @staticmethod
+    def _normalize_rounding(rounding):
+        if not isinstance(rounding, str):
+            raise AdaptationError("rounding must be a string, one of: %s" % (", ".join(FixedPoint._ROUNDING_MODES),))
+        mode = rounding.lower().replace("-", "_")
+        if mode.startswith("round_"):
+            mode = mode[len("round_"):]
+        if mode not in FixedPoint._ROUNDING_MODES:
+            raise AdaptationError("rounding must be one of: %s" % (", ".join(FixedPoint._ROUNDING_MODES),))
+        return mode
+
+    @staticmethod
+    def _to_decimal(value, name):
+        if isinstance(value, float):
+            raise AdaptationError("%s must not be a float (would lose precision), pass an int, str or Decimal instead" % (name,))
+        if isinstance(value, decimal.Decimal):
+            result = value
+        else:
+            try:
+                result = decimal.Decimal(value)
+            except (TypeError, decimal.InvalidOperation, ValueError):
+                raise AdaptationError("%s must be an int, str or Decimal, got %r" % (name, value))
+        if not result.is_finite():
+            raise AdaptationError("%s must be finite, got %s" % (name, result))
+        return result
+
+    def _parameters(self, context):
+        scale = self._to_decimal(self.scale(context) if callable(self.scale) else self.scale, "scale")
+        if scale == 0:
+            raise AdaptationError("scale must be non-zero")
+        offset = self._to_decimal(self.offset(context) if callable(self.offset) else self.offset, "offset")
+        return scale, offset
+
+    def _decode(self, obj, context, path):
+        scale, offset = self._parameters(context)
+        rawdigits = len(str(abs(obj)))
+        with decimal.localcontext() as ctx:
+            ctx.prec = max(28, rawdigits + len(scale.as_tuple().digits) + 2)
+            product = decimal.Decimal(obj) * scale
+            hi = max(product.adjusted(), offset.adjusted())
+            lo = min(product.as_tuple().exponent, offset.as_tuple().exponent)
+            ctx.prec = max(28, hi - lo + 2)
+            return product + offset
+
+    def _encode(self, obj, context, path):
+        scale, offset = self._parameters(context)
+        value = self._to_decimal(obj, "build value")
+        bits = self.bits(context) if callable(self.bits) else self.bits
+        if bits is None:
+            try:
+                bits = self.subcon._sizeof(context, path) * 8
+            except SizeofError:
+                raise AdaptationError("bits was not provided and cannot be inferred from the subcon")
+        if isinstance(bits, bool) or not isinstance(bits, int) or bits <= 0:
+            raise AdaptationError("bits must be a positive integer, got %r" % (bits,))
+        raw = self._round_to_int((fractions.Fraction(value) - fractions.Fraction(offset)) / fractions.Fraction(scale), self.rounding)
+        rawmin = -(1 << (bits - 1))
+        rawmax = (1 << (bits - 1)) - 1
+        if not rawmin <= raw <= rawmax:
+            if self.onoverflow == "error":
+                raise AdaptationError("raw value %s does not fit into signed %s-bit range [%s, %s]" % (raw, bits, rawmin, rawmax))
+            if self.onoverflow == "saturate":
+                raw = min(max(raw, rawmin), rawmax)
+            else:
+                raw = (raw - rawmin) % (1 << bits) + rawmin
+        return raw
+
+    @staticmethod
+    def _round_to_int(frac, mode):
+        quotient, remainder = divmod(frac.numerator, frac.denominator)
+        if remainder == 0:
+            return quotient
+        if mode == "floor":
+            return quotient
+        if mode == "ceil":
+            return quotient + 1
+        if mode == "down":
+            return quotient if frac >= 0 else quotient + 1
+        if mode == "up":
+            return quotient + 1 if frac >= 0 else quotient
+        twice = 2 * remainder
+        if twice < frac.denominator:
+            return quotient
+        if twice > frac.denominator:
+            return quotient + 1
+        if mode == "half_even":
+            return quotient if quotient % 2 == 0 else quotient + 1
+        if mode == "half_up":
+            return quotient + 1 if frac >= 0 else quotient
+        return quotient if frac >= 0 else quotient + 1
 
 
 def OneOf(subcon, valids):
