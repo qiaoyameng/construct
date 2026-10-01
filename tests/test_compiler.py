@@ -23,6 +23,11 @@ example = Struct(
     "bitsinteger1" / BitsInteger(16, signed=True),
     "bitsinteger2" / BitsInteger(16, swapped=True),
     "bitsinteger3" / BitsInteger(this.num+1),
+    "bitsintegerlsb" / BitStruct(
+        "a" / BitsInteger(3),
+        "b" / BitsInteger(11, lsb=True),
+        "c" / BitsInteger(2),
+    ),
     "int1" / Byte,
     "int2" / Int64ub,
     "float1" / Half,

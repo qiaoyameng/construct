@@ -3,14 +3,16 @@ from construct.lib import *
 import binascii
 
 
-def integer2bits(number, width, signed=False):
+def integer2bits(number, width, signed=False, lsb=False):
     r"""
-    Converts an integer into its binary representation in a bit-string. Width is the amount of bits to generate. Each bit is represented as either \\x00 or \\x01. The most significant bit is first, big-endian. This is reverse to `bits2integer`.
+    Converts an integer into its binary representation in a bit-string. Width is the amount of bits to generate. Each bit is represented as either \\x00 or \\x01. By default the most significant bit is first, big-endian. Set lsb to emit the least significant bit first. This is reverse to `bits2integer`.
 
     Examples:
 
         >>> integer2bits(19, 8)
         b'\x00\x00\x00\x01\x00\x00\x01\x01'
+        >>> integer2bits(19, 8, lsb=True)
+        b'\x01\x01\x00\x00\x01\x00\x00\x00'
     """
     if not width >= 1:
         raise ValueError(f"width {width} must be positive")
@@ -32,6 +34,8 @@ def integer2bits(number, width, signed=False):
         bits[i] = number & 1
         number >>= 1
         i -= 1
+    if lsb:
+        bits = bits[::-1]
     return bytes(bits)
 
 
@@ -54,17 +58,22 @@ def integer2bytes(number, width, signed=False):
         raise ValueError(f"number {number} does not fit width {width}, signed {signed}")
 
 
-def bits2integer(data, signed=False):
+def bits2integer(data, signed=False, lsb=False):
     r"""
-    Converts a bit-string into an integer. Set signed to interpret the number as a 2-s complement signed integer. This is reverse to `integer2bits`.
+    Converts a bit-string into an integer. Set signed to interpret the number as a 2-s complement signed integer. Set lsb when the least significant bit comes first. This is reverse to `integer2bits`.
 
     Examples:
 
         >>> bits2integer(b"\x01\x00\x00\x01\x01")
         19
+        >>> bits2integer(b"\x01\x01\x00\x00\x01\x00\x00\x00", lsb=True)
+        19
     """
     if data == b"":
         raise ValueError("bit-string cannot be empty")
+
+    if lsb:
+        data = data[::-1]
 
     number = 0
     for b in data:

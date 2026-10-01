@@ -533,6 +533,35 @@ class Construct(object):
             def reuse(obj, func):
                 return func(obj)
 
+            def parse_bitsinteger(io, length, swapped, lsb, signed):
+                if length <= 0:
+                    raise IntegerError(f"length {length} must be positive")
+                try:
+                    data = io.read(length)
+                    if swapped:
+                        data = swapbytesinbits(data)
+                    if lsb:
+                        data = data[::-1]
+                    return bits2integer(data, signed)
+                except ValueError as e:
+                    raise IntegerError(str(e))
+
+            def build_bitsinteger(obj, io, length, swapped, lsb, signed):
+                if not isinstance(obj, int):
+                    raise IntegerError(f"value {obj} is not an integer")
+                if length <= 0:
+                    raise IntegerError(f"length {length} must be positive")
+                try:
+                    data = integer2bits(obj, length, signed)
+                    if swapped:
+                        data = swapbytesinbits(data)
+                    if lsb:
+                        data = data[::-1]
+                    io.write(data)
+                    return obj
+                except ValueError as e:
+                    raise IntegerError(str(e))
+
             linkedinstances = {}
             linkedparsers = {}
             linkedbuilders = {}
@@ -1082,7 +1111,7 @@ def Bytewise(subcon):
     r"""
     Converts the bitstream back to normal byte stream. Must be used within :class:`~construct.core.Bitwise`.
 
-    Parsing building and size are deferred to subcon, although size gets multiplied by 8.
+    Parsing building and size are deferred to subcon, although size gets multiplied by 8. It must be used within a bit stream; its subcon must consume whole byte groups formed from that stream.
 
     :param subcon: Construct instance, any field that works with bytes or is bit-byte agnostic
 
@@ -1303,9 +1332,7 @@ class BitsInteger(Construct):
         BytesInteger(n) <--> Bitwise(BitsInteger(8*n))
         BitsInteger(8*n) <--> Bytewise(BytesInteger(n))
 
-    Note that little-endianness is only defined for multiples of 8 bits.
-
-    Byte ordering (i.e. `swapped` parameter) refers to bytes (chunks of 8 bits) so, for example::
+    Byte ordering (i.e. `swapped` parameter) refers to bytes (chunks of 8 bits) and is independent from bit ordering. Set ``lsb=True`` or ``bit_order="lsb"`` to interpret an integer's least significant bit as the first transmitted bit. Unlike ``swapped``, this bit reversal covers the entire declared field and therefore also works for widths that are not multiples of 8, including an 11-bit field. For example::
 
         BytesInteger(n, swapped=True) <--> Bitwise(BitsInteger(8*n, swapped=True))
 
@@ -1314,12 +1341,14 @@ class BitsInteger(Construct):
     :param length: integer or context lambda, number of bits in the field
     :param signed: bool, whether the value is signed (two's complement), default is False (unsigned)
     :param swapped: bool or context lambda, whether to swap byte order (little endian), default is False (big endian)
+    :param lsb: optional bool, whether bits of this integer arrive least-significant-bit first, default is False
+    :param bit_order: optional string, ``"msb"``/``"big"`` or ``"lsb"``/``"little"``; mutually exclusive with lsb
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
     :raises IntegerError: length is negative or zero
     :raises IntegerError: value is not an integer
     :raises IntegerError: number does not fit given width and signed parameters
-    :raises IntegerError: little-endianness selected but length is not multiple of 8 bits
+    :raises IntegerError: swapped byte order selected but length is not a multiple of 8 bits
 
     Can propagate any exception from the lambda, possibly non-ConstructError.
 
@@ -1353,13 +1382,35 @@ class BitsInteger(Construct):
         >>> d = ByteSwapped(BitsInteger(16, swapped=True)) # Byte-Level Big-Endian, Bit-Level Little-Endian
         >>> d.build(5 + 19*256)
         b'\x01\x01\x00\x00\x01\x00\x00\x00\x01\x00\x01\x00\x00\x00\x00\x00'
+
+    An 11-bit field transmitted LSB first is independent from byte order. The reversal is limited to those 11 bits, even when the field crosses an underlying byte boundary::
+
+        >>> d = BitStruct("a" / BitsInteger(3), "b" / BitsInteger(11, lsb=True), "c" / BitsInteger(2))
+        >>> d.parse(b"\x18\x00")
+        Container(a=0, b=3, c=0)
     """
 
-    def __init__(self, length, signed=False, swapped=False):
+    def __init__(self, length, signed=False, swapped=False, lsb=None, *, bit_order=None):
         super().__init__()
         self.length = length
         self.signed = signed
         self.swapped = swapped
+        if lsb is not None and bit_order is not None:
+            raise ValueError("lsb and bit_order cannot both be provided")
+        if lsb is not None:
+            self.lsb = bool(lsb)
+        elif bit_order is None:
+            self.lsb = False
+        elif isinstance(bit_order, str):
+            normalized = bit_order.lower()
+            if normalized in ("msb", "msb-first", "big", "be"):
+                self.lsb = False
+            elif normalized in ("lsb", "lsb-first", "little", "le"):
+                self.lsb = True
+            else:
+                raise ValueError(f"invalid bit_order {bit_order!r}")
+        else:
+            raise ValueError("bit_order must be a string")
 
     def _parse(self, stream, context, path):
         length = evaluate(self.length, context)
@@ -1369,6 +1420,8 @@ class BitsInteger(Construct):
         try:
             if evaluate(self.swapped, context):
                 data = swapbytesinbits(data)
+            if self.lsb:
+                data = data[::-1]
             return bits2integer(data, self.signed)
         except ValueError as e:
             raise IntegerError(str(e), path=path)
@@ -1383,6 +1436,8 @@ class BitsInteger(Construct):
             data = integer2bits(obj, length, self.signed)
             if evaluate(self.swapped, context):
                 data = swapbytesinbits(data)
+            if self.lsb:
+                data = data[::-1]
         except ValueError as e:
             raise IntegerError(str(e), path=path)
         stream_write(stream, data, length, path)
@@ -1395,14 +1450,15 @@ class BitsInteger(Construct):
             raise SizeofError("cannot calculate size, key not found in context", path=path)
 
     def _emitparse(self, code):
-        return f"bits2integer(swapbytesinbits(io.read({self.length})) if {self.swapped} else io.read({self.length}), {self.signed})"
+        return f"parse_bitsinteger(io, {self.length}, {self.swapped}, {self.lsb}, {self.signed})"
 
     def _emitbuild(self, code):
-        return f"((io.write(swapbytesinbits(integer2bits(obj, {self.length}, {self.signed})) if ({self.swapped}) else integer2bits(obj, {self.length}, {self.signed}))), obj)[1]"
+        return f"build_bitsinteger(obj, io, {self.length}, {self.swapped}, {self.lsb}, {self.signed})"
 
     def _emitprimitivetype(self, ksy, bitwise):
         assert not self.signed
         assert not self.swapped
+        assert not self.lsb
         return "b%s" % (self.length, )
 
 

@@ -44,11 +44,34 @@ Container(a=True, b=7, c=887, d=None)
 ``BitStruct`` is actually just a wrapper for the ``Bitwise`` around a ``Struct`` .
 
 
+Bit ordering
+============
+
+``Bitwise`` exposes a byte as eight transmitted bits, most-significant bit first. ``BitsInteger`` therefore also interprets its bits most-significant bit first by default.
+
+The ``swapped=True`` argument is *byte* order, not bit order. It divides a field into chunks of eight bits and swaps those chunks, so it is only valid when the field width is a multiple of eight.
+
+For a hardware field whose least significant bit is transmitted first, use the independent bit order declaration ``BitsInteger(width, lsb=True)`` (or ``bit_order="lsb"``). It reverses only the bits of that one integer, including fields such as 3 or 11 bits that cannot be represented as whole bytes::
+
+    >>> d = BitStruct(
+    ...     "first" / BitsInteger(3),
+    ...     "middle" / BitsInteger(11, lsb=True),
+    ...     "last" / BitsInteger(2),
+    ... )
+    >>> transmitted = b"\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    >>> d.parse(bits2bytes(transmitted))
+    Container(first=0, middle=3, last=0)
+
+The reversal is applied to exactly the declared 11 bits. Although those bits span the underlying byte boundary, the neighboring 3-bit and 2-bit fields are parsed and written in normal stream order and are not reversed.
+
+
 Important notes
 ===============
 
-* ``BitStruct``'s are non-nestable (because ``Bitwise`` are not nestable) so writing something like ``BitStruct(BitStruct(Octet))`` will not work. You can use regular ``Struct`` inside ``BitStruct`` .
-* Byte aligned - The total size of the elements of a ``BitStruct`` must be a multiple of 8 (due to alignment issues). ``RestreamedBytesIO`` will raise an error if the amount of bits and bytes does not align properly.
+* Do not nest ``Bitwise`` directly in ``Bitwise``. A bit stream cannot be expanded into bits again; use a regular ``Struct`` to group fields inside an existing bitwise context.
+* ``Bytewise`` is valid only inside a ``Bitwise`` (or another bit stream). It groups the next eight enclosing bits into one byte; the inner construct must consume and produce a whole number of such byte groups.
+* Returning from ``Bytewise`` to the enclosing ``Bitwise`` (including with an inner ``Bitwise``) resumes the same outer bit stream, but two ``Bitwise`` layers cannot be nested directly without an intervening byte-oriented context.
+* The bit-oriented construct must be byte aligned as a whole. The total size of a top-level ``BitStruct`` must be a multiple of 8; individual fields may cross byte boundaries, as the 3/11/2-bit example does, but all fields together must fill complete bytes. ``RestreamedBytesIO`` raises if bits are left over.
 * ``GreedyRange``, ``Pointer`` and any ``Lazy*`` - Do not place fields that do seeking/telling or lazy parsing inside ``Bitwise``, because ``RestreamedBytesIO`` offsets will turn out wrong, have unknown side-effects or raise unknown exceptions.
 * Normal (byte-oriented) classes like ``Int*`` or ``Float*`` can be used by wrapping in ``Bytewise``. If you need to mix byte- and bit-oriented fields, you should use a ``BitStruct`` and ``Bytewise`` .
 * Advanced classes like tunneling may not work in bitwise context. Only basic fields like integers were throughly tested.

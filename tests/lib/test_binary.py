@@ -7,6 +7,7 @@ def test_integer2bits():
     assert raises(integer2bits, 0, 0, True) == ValueError
     assert integer2bits(19, 5) == b"\x01\x00\x00\x01\x01"
     assert integer2bits(19, 8) == b"\x00\x00\x00\x01\x00\x00\x01\x01"
+    assert integer2bits(19, 8, lsb=True) == b"\x01\x01\x00\x00\x01\x00\x00\x00"
     assert integer2bits(-13, 5, True) == b"\x01\x00\x00\x01\x01"
     assert integer2bits(-13, 8, True) == b"\x01\x01\x01\x01\x00\x00\x01\x01"
     assert raises(integer2bits, 0, -1) == ValueError
@@ -38,6 +39,8 @@ def test_bits2integer():
     assert raises(bits2integer, b"", True) == ValueError
     assert bits2integer(b"\x01\x00\x00\x01\x01", False) == 19
     assert bits2integer(b"\x01\x00\x00\x01\x01", True) == -13
+    assert bits2integer(b"\x01\x01\x00\x00\x01\x00\x00\x00", lsb=True) == 19
+    assert bits2integer(integer2bits(-13, 8, True, lsb=True), True, lsb=True) == -13
 
 def test_bytes2integer():
     assert raises(bytes2integer, b"", False) == ValueError

@@ -183,6 +183,52 @@ def test_bitsinteger():
     assert raises(BitsInteger(8, False).build,  2**64) == IntegerError
     assert raises(BitsInteger(this.missing).sizeof) == SizeofError
 
+def test_bitsinteger_lsb_bit_order():
+    format = BitStruct(
+        "first" / BitsInteger(3),
+        "middle" / BitsInteger(11, lsb=True),
+        "last" / BitsInteger(2),
+    )
+    transmitted = bytes([0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0])
+    data = bits2bytes(transmitted)
+    obj = Container(first=0, middle=3, last=0)
+    common(format, data, obj, 2)
+    assert bytes2bits(data) == transmitted
+
+    signed_format = BitStruct(
+        "first" / BitsInteger(3),
+        "middle" / BitsInteger(11, signed=True, bit_order="lsb"),
+        "last" / BitsInteger(2),
+    )
+    signed_transmitted = bytes([0,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0])
+    signed_data = bits2bytes(signed_transmitted)
+    signed_obj = Container(first=0, middle=-2, last=0)
+    common(signed_format, signed_data, signed_obj, 2)
+    assert bytes2bits(signed_data) == signed_transmitted
+
+    assert raises(BitsInteger(11).build, -1) == IntegerError
+    assert raises(BitsInteger(11, signed=True).build, -1025) == IntegerError
+    assert raises(BitsInteger(11, signed=True).build, 1024) == IntegerError
+    assert raises(format.compile().build, Container(first=0, middle=2048, last=0)) == IntegerError
+    with pytest.raises(ValueError, match="cannot both be provided"):
+        BitsInteger(3, lsb=True, bit_order="lsb")
+    with pytest.raises(ValueError, match="invalid bit_order"):
+        BitsInteger(3, bit_order="crosswise")
+
+def test_bitsinteger_lsb_is_not_swapped_byte_order():
+    assert BitsInteger(11, lsb=True).sizeof() == 11
+    assert raises(BitsInteger(11, swapped=True).parse, bytes(11)) == IntegerError
+    assert raises(BitsInteger(11, swapped=True).build, 0) == IntegerError
+
+    combined = BitStruct(
+        "first" / BitsInteger(3),
+        "middle" / BitsInteger(11, lsb=True),
+        "last" / BitsInteger(2),
+    )
+    transmitted = bytes([0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0])
+    obj = combined.parse(bits2bytes(transmitted))
+    assert obj == Container(first=0, middle=20, last=0)
+
 def test_varint():
     d = VarInt
     common(d, b"\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x10", 2**123, SizeofError)
