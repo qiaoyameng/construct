@@ -1033,6 +1033,8 @@ def Bitwise(subcon):
 
     Parsing building and size are deferred to subcon, although size gets divided by 8 (therefore the subcon's size must be a multiple of 8).
     
+    If the underlying stream is seekable, Tell Seek and Pointer can be used inside, with positions expressed in logical bits relative to the start of this Bitwise region. When the region exits, the outer stream is positioned right after the consumed bytes. Exiting at a bit position that is not a multiple of 8 raises an error.
+
     Note that by default the bit ordering is from MSB to LSB for every byte (ie. bit-level big-endian). If you need it reversed, wrap this subcon with :class:`construct.core.BitsSwapped`.
 
     :param subcon: Construct instance, any field that works with bits (like BitsInteger) or is bit-byte agnostic (like Struct or Flag)
@@ -1083,6 +1085,8 @@ def Bytewise(subcon):
     Converts the bitstream back to normal byte stream. Must be used within :class:`~construct.core.Bitwise`.
 
     Parsing building and size are deferred to subcon, although size gets multiplied by 8.
+
+    Can be entered at a bit position that is not a multiple of 8, in which case the declared bits are processed as-is. Writing a partial byte that has no data to merge with raises an error instead of silently zero-padding.
 
     :param subcon: Construct instance, any field that works with bytes or is bit-byte agnostic
 
@@ -5309,7 +5313,7 @@ class Restreamed(Subconstruct):
 
     .. warning:: Remember that subcon must consume or produce an amount of bytes that is a multiple of encoding or decoding units. For example, in a Bitwise context you should process a multiple of 8 bits or the stream will fail during parsing/building.
 
-    .. warning:: Do NOT use seeking/telling classes inside Restreamed context.
+    .. note:: If the underlying stream is seekable and the decoder/encoder pair is a fixed-ratio conversion (like the ones used by :class:`~construct.core.Bitwise` and :class:`~construct.core.Bytewise`), the subcon is provided a :class:`~construct.lib.SeekableRestreamedBytesIO` stream where seeking and telling work in decoded units (eg. bits in a Bitwise context), so classes like Seek Tell and Pointer can be used. Variable-length codecs (like zlib) and non-seekable streams fall back to non-seekable :class:`~construct.lib.RestreamedBytesIO`.
 
     :param subcon: Construct instance
     :param decoder: bytes-to-bytes function, used on data chunks when parsing
@@ -5335,14 +5339,20 @@ class Restreamed(Subconstruct):
         self.encoderunit = encoderunit
         self.sizecomputer = sizecomputer
 
+    def _makestream2(self, stream):
+        try:
+            return SeekableRestreamedBytesIO(stream, self.decoder, self.decoderunit, self.encoder, self.encoderunit)
+        except ValueError:
+            return RestreamedBytesIO(stream, self.decoder, self.decoderunit, self.encoder, self.encoderunit)
+
     def _parse(self, stream, context, path):
-        stream2 = RestreamedBytesIO(stream, self.decoder, self.decoderunit, self.encoder, self.encoderunit)
+        stream2 = self._makestream2(stream)
         obj = self.subcon._parsereport(stream2, context, path)
         stream2.close()
         return obj
 
     def _build(self, obj, stream, context, path):
-        stream2 = RestreamedBytesIO(stream, self.decoder, self.decoderunit, self.encoder, self.encoderunit)
+        stream2 = self._makestream2(stream)
         buildret = self.subcon._build(obj, stream2, context, path)
         stream2.close()
         return obj

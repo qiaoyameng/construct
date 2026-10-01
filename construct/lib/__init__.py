@@ -31,6 +31,7 @@ __all__ = [
     'PYPY',
     'RebufferedBytesIO',
     'RestreamedBytesIO',
+    'SeekableRestreamedBytesIO',
     'setGlobalPrintFalseFlags',
     'setGlobalPrintFullStrings',
     'setGlobalPrintPrivateEntries',

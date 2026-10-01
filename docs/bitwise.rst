@@ -49,7 +49,7 @@ Important notes
 
 * ``BitStruct``'s are non-nestable (because ``Bitwise`` are not nestable) so writing something like ``BitStruct(BitStruct(Octet))`` will not work. You can use regular ``Struct`` inside ``BitStruct`` .
 * Byte aligned - The total size of the elements of a ``BitStruct`` must be a multiple of 8 (due to alignment issues). ``RestreamedBytesIO`` will raise an error if the amount of bits and bytes does not align properly.
-* ``GreedyRange``, ``Pointer`` and any ``Lazy*`` - Do not place fields that do seeking/telling or lazy parsing inside ``Bitwise``, because ``RestreamedBytesIO`` offsets will turn out wrong, have unknown side-effects or raise unknown exceptions.
+* ``Tell``, ``Seek`` and ``Pointer`` can be used inside ``Bitwise`` when the underlying stream is seekable. Positions are expressed in logical bits, relative to the start of the ``Bitwise`` region, and the outer stream is left at the correct byte position when the region exits. Exiting at a position that is not a whole number of bytes, or writing a partial byte that has no data to merge with, is rejected with an error instead of being silently zero-padded. Non-seekable streams and variable-length codecs (like zlib) are not supported and fall back to non-seekable restreaming. Any ``Lazy*`` fields should still be avoided, because lazy parsing offsets will turn out wrong.
 * Normal (byte-oriented) classes like ``Int*`` or ``Float*`` can be used by wrapping in ``Bytewise``. If you need to mix byte- and bit-oriented fields, you should use a ``BitStruct`` and ``Bytewise`` .
 * Advanced classes like tunneling may not work in bitwise context. Only basic fields like integers were throughly tested.
 
@@ -119,7 +119,7 @@ So unlike "classical Construct", there's no need for ``BytePadding`` and ``BitPa
 Fields that do not work and fail
 =======================================
 
-Following classes may not work within ``Bitwise`` or ``Bytewise`` depending one some circumstances. Actually this section applies to ``ByteSwapped`` and ``BitsSwapped`` as well. Those 4 are macros and resolve to either ``Transformed`` or ``Restreamed`` depending if subcon is fixed-sized and therefore the data can be prefetched entirely. If yes, then it turns into ``Transformed`` and should work just fine, it not, then it turns into ``Restreamed`` which uses ``RestreamedBytesIO`` which has several limitations in its implementation. Milage may vary.
+Following classes may not work within ``Bitwise`` or ``Bytewise`` depending one some circumstances. Actually this section applies to ``ByteSwapped`` and ``BitsSwapped`` as well. Those 4 are macros and resolve to either ``Transformed`` or ``Restreamed`` depending if subcon is fixed-sized and therefore the data can be prefetched entirely. If yes, then it turns into ``Transformed`` and should work just fine, it not, then it turns into ``Restreamed`` which uses ``SeekableRestreamedBytesIO`` on seekable streams (supporting seeking/telling in decoded units) and otherwise falls back to ``RestreamedBytesIO`` which has several limitations in its implementation. Milage may vary.
 
 Those do use stream seeking or telling (or both):
 

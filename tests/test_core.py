@@ -45,6 +45,102 @@ def test_bytewise():
     common(Bitwise(Sequence(Nibble, Bytewise(Int24ub), Nibble)), b"\xf0\x10\x20\x3f", [0x0f,0x010203,0x0f], 4)
     common(Bitwise(Bytewise(GreedyBytes)), bytes(10), bytes(10), SizeofError)
 
+def test_bitwise_seeking():
+    # Tell Seek Pointer work in bit units inside Bitwise (Restreamed path)
+    d = Bitwise(Struct(
+        'a' / BitsInteger(4),
+        't1' / Tell,
+        'p1' / Pointer(16, BitsInteger(4)),
+        'p2' / Pointer(4, BitsInteger(4)),
+        'b' / Bytewise(Byte),
+        't2' / Tell,
+        'c' / BitsInteger(4),
+        's' / Seek(20),
+        'd' / BitsInteger(4),
+        't3' / Tell,
+    ))
+    common(d, b"\xab\xcd\xef", Container(a=0xa, t1=4, p1=0xe, p2=0xb, b=0xbc, t2=12, c=0xd, s=20, d=0xf, t3=24), SizeofError)
+
+    # outer stream position is restored when the Bitwise context exits
+    d = Struct(
+        'header' / Byte,
+        'bits' / Bitwise(Struct(
+            'a' / BitsInteger(4),
+            'p' / Pointer(16, BitsInteger(4)),
+            'b' / Bytewise(Byte),
+            'c' / BitsInteger(4),
+            's' / Seek(20),
+            'd' / BitsInteger(4),
+        )),
+        'trailer' / Byte,
+    )
+    common(d, b"\x11\xab\xcd\xef\x22", Container(header=0x11, bits=Container(a=0xa, p=0xe, b=0xbc, c=0xd, s=20, d=0xf), trailer=0x22), SizeofError)
+
+    # Bytewise at an unaligned bit position processes the declared bits
+    d = Bitwise(Struct(
+        'a' / BitsInteger(4),
+        'b' / Bytewise(Bytes(2)),
+        'c' / BitsInteger(4),
+        'rest' / GreedyBytes,
+    ))
+    common(d, b"\xab\xcd\xef", Container(a=0xa, b=b"\xbc\xde", c=0xf, rest=b""), SizeofError)
+
+def test_bitwise_seeking_boundaries():
+    # pointer with negative offset seeks from EOF, in bits, parse/build symmetric
+    d = Bitwise(Struct(
+        'a' / BitsInteger(4),
+        'rest' / GreedyBytes,
+        'last' / Pointer(-4, BitsInteger(4)),
+    ))
+    common(d, b"\xab\xcd", Container(a=0xa, last=0xd, rest=bytes2bits(b"\xab\xcd")[4:]), SizeofError)
+
+    # seeking to exactly the end leaves nothing to read
+    d = Bitwise(Struct(
+        'a' / BitsInteger(16),
+        's' / Seek(16),
+        'rest' / GreedyBytes,
+    ))
+    common(d, b"\xab\xcd", Container(a=0xabcd, s=16, rest=b""), SizeofError)
+
+    # reading past the end is a short read
+    d = Bitwise(Struct('a' / BitsInteger(4), 'b' / Bytewise(Byte), 'rest' / GreedyBytes))
+    assert raises(d.parse, b"\xff") == StreamError
+
+    # seeking to a negative position is rejected
+    d = Bitwise(Struct('s' / Seek(-1), 'rest' / GreedyBytes))
+    assert raises(d.parse, b"\xff") == StreamError
+
+def test_bitwise_seeking_unaligned():
+    # exiting Bitwise at a position not aligned to whole bytes is rejected
+    d = Bitwise(Struct('a' / BitsInteger(4), 's' / Seek(12)))
+    assert raises(d.parse, b"\xff\xff") == ValueError
+
+    # writing a partial byte with nothing to merge with is rejected, not zero-padded
+    d = Bitwise(Struct('s' / Seek(4), 'a' / BitsInteger(4)))
+    assert raises(d.build, dict(a=1)) == ValueError
+
+def test_bitwise_nonseekable_stream():
+    class NonSeekable(io.BytesIO):
+        def seekable(self):
+            return False
+        def seek(self, *args):
+            raise io.UnsupportedOperation("not seekable")
+
+    # non-seekable streams fall back to non-seekable restreaming
+    d = Bitwise(GreedyBytes)
+    assert d.parse_stream(NonSeekable(b"\xff\x00")) == bytes2bits(b"\xff\x00")
+
+    # and seeking inside is properly rejected
+    d = Bitwise(Struct('a' / BitsInteger(8), 'p' / Pointer(0, BitsInteger(8)), 'rest' / GreedyBytes))
+    assert raises(d.parse_stream, NonSeekable(b"\xff\x00")) == StreamError
+
+def test_restreamed_variable_codec_not_seekable():
+    # non fixed-ratio conversions fall back to non-seekable restreaming
+    decoder = lambda data: data.replace(b"\x00", b"\x00\x00")
+    encoder = lambda data: data
+    d = Restreamed(Struct('a' / Byte, 'p' / Pointer(0, Byte)), decoder, 1, encoder, 2, None)
+    assert raises(d.parse, b"\x01\x02") == StreamError
+
 def test_ints():
     common(Byte, b"\xff", 255, 1)
     common(Short, b"\x00\xff", 255, 2)
