@@ -156,6 +156,11 @@ class CipherError(ConstructError):
     Two parsing classes can raise this exception: EncryptedSym EncryptedSymAead. It can mean none or invalid cipher object was provided.
     """
     pass
+class LayoutError(ConstructError):
+    """
+    Relocation classes can raise this exception: Relocatable Section OffsetOf. It can mean an offset field references an unknown section, a section is defined twice, the layout did not converge, a parsed offset does not match its section, or an offset points outside the stream.
+    """
+    pass
 
 
 
@@ -4753,6 +4758,315 @@ class Terminated(Construct):
 
     def _sizeof(self, context, path):
         raise SizeofError(path=path)
+
+
+#===============================================================================
+# named sections and relocation fields
+#===============================================================================
+class _LayoutRef(object):
+    r"""Bookkeeping record for one built or parsed OffsetOf field."""
+    __slots__ = ("section", "position", "value", "relative")
+
+    def __init__(self, section, position, value, relative):
+        self.section = section
+        self.position = position
+        self.value = value
+        self.relative = relative
+
+
+class _LayoutState(object):
+    r"""
+    Layout bookkeeping shared by all Section and OffsetOf fields within one Relocatable scope. Sections maps names to (start, end) stream positions. Refs lists offset fields in the order they were processed during the current iteration. Values holds the offset values to write during the current iteration, as computed from the previous iteration.
+    """
+    __slots__ = ("sections", "refs", "values")
+
+    def __init__(self):
+        self.sections = {}
+        self.refs = []
+        self.values = []
+
+    def begin_section(self, name, start, path):
+        if name in self.sections:
+            raise LayoutError("section %r is defined more than once" % (name,), path=path)
+        self.sections[name] = (start, start)
+
+    def end_section(self, name, end):
+        self.sections[name] = (self.sections[name][0], end)
+
+
+def _getlayout(context):
+    params = context.get("_params", None)
+    if params is None:
+        return None
+    return params.get("_layout", None)
+
+
+def _installlayout(context, layout):
+    params = context.get("_params", None)
+    if params is None:
+        return None
+    token = (params, params.get("_layout", None), "_layout" in params)
+    params["_layout"] = layout
+    return token
+
+
+def _restorelayout(token):
+    if token is None:
+        return
+    params, previous, existed = token
+    if existed:
+        params["_layout"] = previous
+    else:
+        params.pop("_layout", None)
+
+
+class Section(Subconstruct):
+    r"""
+    Named region of the stream that offset fields can refer to.
+
+    Parsing aligns the stream (by seeking) and records where the section landed, then defers to the subcon. Building aligns the stream (by writing pad bytes) and records where the section landed, then defers to the subcon. When enclosed in a :class:`~construct.core.Relocatable`, the recorded positions are used to fill in :class:`~construct.core.OffsetOf` fields and to validate them when parsing. Can also be used standalone, in which case it only performs the alignment.
+
+    Sections can be nested, and each section (including nested ones) is registered under its own name. Defining two sections under the same name within one Relocatable scope raises LayoutError.
+
+    :param name: string, the label that OffsetOf fields refer to
+    :param subcon: Construct instance, the section contents
+    :param align: optional, integer or context lambda, alignment modulus of the section start, default 1 (no alignment)
+    :param padbyte: optional, bytes of length 1, padding pattern used when building, default b"\x00"
+
+    :raises LayoutError: align is less than 1, or the section name is already taken within the enclosing Relocatable
+    :raises StreamError: stream is not seekable and tellable
+
+    Example::
+
+        >>> d = Relocatable(Struct(
+        ...     "offset" / OffsetOf("data", Int32ub),
+        ...     "data" / Section("data", Bytes(2), align=8),
+        ... ))
+        >>> d.build(dict(data=b"XY"))
+        b'\x00\x00\x00\x08\x00\x00\x00\x00XY'
+        >>> d.parse(_)
+        Container(offset=8, data=b'XY')
+    """
+
+    def __init__(self, name, subcon, align=1, padbyte=b"\x00"):
+        super().__init__(subcon)
+        if not isinstance(name, str) or not name:
+            raise ValueError("Section name must be a non-empty string")
+        if not (isinstance(padbyte, bytes) and len(padbyte) == 1):
+            raise ValueError("Section padbyte must be bytes of length 1")
+        self.sectionname = name
+        self.align = align
+        self.padbyte = padbyte
+
+    def _alignment(self, context, path):
+        align = evaluate(self.align, context)
+        if not isinstance(align, int) or align < 1:
+            raise LayoutError("Section align must be a positive integer", path=path)
+        return align
+
+    def _parse(self, stream, context, path):
+        align = self._alignment(context, path)
+        pos = stream_tell(stream, path)
+        pad = (-pos) % align
+        if pad:
+            stream_seek(stream, pad, 1, path)
+            pos += pad
+        layout = _getlayout(context)
+        if layout is not None:
+            layout.begin_section(self.sectionname, pos, path)
+        obj = self.subcon._parsereport(stream, context, path)
+        if layout is not None:
+            layout.end_section(self.sectionname, stream_tell(stream, path))
+        return obj
+
+    def _build(self, obj, stream, context, path):
+        align = self._alignment(context, path)
+        pos = stream_tell(stream, path)
+        pad = (-pos) % align
+        if pad:
+            stream_write(stream, self.padbyte * pad, pad, path)
+            pos += pad
+        layout = _getlayout(context)
+        if layout is not None:
+            layout.begin_section(self.sectionname, pos, path)
+        buildret = self.subcon._build(obj, stream, context, path)
+        if layout is not None:
+            layout.end_section(self.sectionname, stream_tell(stream, path))
+        return buildret
+
+    def _sizeof(self, context, path):
+        align = evaluate(self.align, context)
+        if align != 1:
+            raise SizeofError("Section size depends on stream position when aligned", path=path)
+        return self.subcon._sizeof(context, path)
+
+
+class OffsetOf(Subconstruct):
+    r"""
+    Integer field that stores the offset of a named section.
+
+    Parsing reads an integer using the subcon and returns it, like a plain field would. When enclosed in a :class:`~construct.core.Relocatable`, the value is also validated against the actual layout: it must point at the referenced section, or (if no such section was parsed) at least within the stream bounds.
+
+    Building computes the value from the final layout, so the object dict does not need to contain a value for this field. The value written is the absolute stream position of the referenced section, or the distance from this field to the section if `relative` is set. Several fields may refer to the same section, and references may be forward (section comes later in the stream) or backward.
+
+    The subcon may be a variable-length integer (like VarInt). Since the encoded length of the field affects the layout itself, building iterates until the layout converges, and raises LayoutError if it does not. If the offset does not fit the subcon (for example a section beyond offset 255 referenced by a Byte field), building fails with the error raised by the subcon.
+
+    :param section: string, name of the referenced Section
+    :param subcon: optional, Construct instance, an integer field like Int32ub or VarInt, default Int32ub
+    :param relative: optional, boolean, interpret the offset as relative to this field position instead of absolute, default False
+
+    :raises LayoutError: building outside a Relocatable scope, the referenced section is unknown, the layout did not converge, or a parsed offset does not match the referenced section
+
+    Example::
+
+        >>> d = Relocatable(Struct(
+        ...     "offset" / OffsetOf("data"),
+        ...     "data" / Section("data", Bytes(2)),
+        ... ))
+        >>> d.build(dict(data=b"XY"))
+        b'\x00\x00\x00\x04XY'
+        >>> d.parse(_)
+        Container(offset=4, data=b'XY')
+    """
+
+    def __init__(self, section, subcon=None, relative=False):
+        if subcon is None:
+            subcon = Int32ub
+        super().__init__(subcon)
+        if not isinstance(section, str) or not section:
+            raise ValueError("OffsetOf section must be a non-empty string")
+        self.section = section
+        self.relative = relative
+        self.flagbuildnone = True
+
+    def _parse(self, stream, context, path):
+        pos = stream_tell(stream, path)
+        value = self.subcon._parsereport(stream, context, path)
+        layout = _getlayout(context)
+        if layout is not None:
+            layout.refs.append(_LayoutRef(self.section, pos, value, self.relative))
+        return value
+
+    def _build(self, obj, stream, context, path):
+        layout = _getlayout(context)
+        if layout is None:
+            raise LayoutError("OffsetOf can only be built within a Relocatable", path=path)
+        index = len(layout.refs)
+        value = layout.values[index] if index < len(layout.values) else 0
+        pos = stream_tell(stream, path)
+        self.subcon._build(value, stream, context, path)
+        layout.refs.append(_LayoutRef(self.section, pos, value, self.relative))
+        return value
+
+    def _sizeof(self, context, path):
+        return self.subcon._sizeof(context, path)
+
+
+class Relocatable(Subconstruct):
+    r"""
+    Enables named sections and relocation fields within the subcon.
+
+    Parsing defers to the subcon, then validates every parsed :class:`~construct.core.OffsetOf` field against the actual layout: offsets referring to a known :class:`~construct.core.Section` must match where the section was parsed, and other offsets must land within the stream bounds. Parsed offset fields still return their plain integer values.
+
+    Building defers to the subcon repeatedly until the layout converges. Each iteration records where the sections landed and which values the offset fields would need, and the next iteration writes those values. This accounts for variable-length offset fields whose encoded size depends on the very offsets they store. Building fails with LayoutError if a section is unknown or duplicated, or if the layout does not stabilize within `maxiterations` passes. The stream must be seekable (BytesIO and files opened in w+b mode are), otherwise StreamError is raised.
+
+    Size is not defined, because it depends on the layout.
+
+    :param subcon: Construct instance
+    :param maxiterations: optional, integer, upper bound on layout passes before giving up, default 100
+
+    :raises LayoutError: offset field references an unknown section, a section is defined twice, the layout did not converge, or a parsed offset does not match its section
+    :raises StreamError: stream is not seekable and truncatable
+
+    Example::
+
+        >>> d = Relocatable(Struct(
+        ...     "offset" / OffsetOf("data", Int16ub),
+        ...     "data" / Section("data", Bytes(2)),
+        ... ))
+        >>> d.build(dict(data=b"XY"))
+        b'\x00\x02XY'
+        >>> d.parse(_)
+        Container(offset=2, data=b'XY')
+    """
+
+    def __init__(self, subcon, maxiterations=100):
+        super().__init__(subcon)
+        if not isinstance(maxiterations, int) or maxiterations < 1:
+            raise ValueError("Relocatable maxiterations must be a positive integer")
+        self.maxiterations = maxiterations
+
+    def _parse(self, stream, context, path):
+        layout = _LayoutState()
+        token = _installlayout(context, layout)
+        try:
+            obj = self.subcon._parsereport(stream, context, path)
+        finally:
+            _restorelayout(token)
+        self._validaterefs(layout, stream, path)
+        return obj
+
+    def _validaterefs(self, layout, stream, path):
+        size = None
+        for ref in layout.refs:
+            if ref.section in layout.sections:
+                start = layout.sections[ref.section][0]
+                expected = start - ref.position if ref.relative else start
+                if ref.value != expected:
+                    raise LayoutError("offset field at position %d has value %d but section %r is at position %d" % (ref.position, ref.value, ref.section, expected), path=path)
+            else:
+                target = ref.position + ref.value if ref.relative else ref.value
+                if target < 0:
+                    raise LayoutError("offset field at position %d points before the stream start, to %d" % (ref.position, target), path=path)
+                if size is None:
+                    try:
+                        size = stream_size(stream)
+                    except StreamError:
+                        size = -1
+                if size >= 0 and target > size:
+                    raise LayoutError("offset field at position %d points past the stream end, to %d (stream size %d)" % (ref.position, target, size), path=path)
+
+    def _build(self, obj, stream, context, path):
+        if not (hasattr(stream, "tell") and hasattr(stream, "seek") and hasattr(stream, "truncate")):
+            raise StreamError("Relocatable requires a seekable and truncatable stream", path=path)
+        try:
+            start = stream.tell()
+            stream.seek(start)
+        except Exception:
+            raise StreamError("Relocatable requires a seekable and truncatable stream", path=path)
+        layout = _LayoutState()
+        token = _installlayout(context, layout)
+        try:
+            values = []
+            for iteration in range(self.maxiterations):
+                stream_seek(stream, start, 0, path)
+                layout.sections = {}
+                layout.refs = []
+                layout.values = values
+                buildret = self.subcon._build(obj, stream, context, path)
+                end = stream_tell(stream, path)
+                try:
+                    stream.truncate(end)
+                except Exception:
+                    raise StreamError("stream.truncate() failed", path=path)
+                desired = []
+                for ref in layout.refs:
+                    if ref.section not in layout.sections:
+                        raise LayoutError("offset field at position %d references unknown section %r" % (ref.position, ref.section), path=path)
+                    secstart = layout.sections[ref.section][0]
+                    desired.append(secstart - ref.position if ref.relative else secstart)
+                if desired == [ref.value for ref in layout.refs]:
+                    break
+                values = desired
+            else:
+                raise LayoutError("layout did not converge after %d iterations" % (self.maxiterations,), path=path)
+            stream_seek(stream, end, 0, path)
+            return buildret
+        finally:
+            _restorelayout(token)
+
+    def _sizeof(self, context, path):
+        raise SizeofError("Relocatable size depends on the layout", path=path)
 
 
 #===============================================================================
