@@ -146,6 +146,11 @@ class ChecksumError(ConstructError):
     Only one parsing class can raise this exception: Checksum. It can mean expected and actual checksum do not match.
     """
     pass
+class RelocationError(ConstructError):
+    """
+    Two parsing classes can raise this exception: Section OffsetField. It can mean a section name is missing or duplicated, an offset value does not fit into its field, the section layout does not converge or has a circular dependency, or a parsed offset does not point into the referenced section.
+    """
+    pass
 class CancelParsing(ConstructError):
     """
     This exception can only be raise explicitly by the user, and it causes the parsing class to stop what it is doing (interrupts parsing or building).
@@ -413,10 +418,15 @@ class Construct(object):
         context._building = False
         context._sizing = False
         context._params = context
+        layout = _RelocationLayout()
+        context._layout = layout
         try:
-            return self._parsereport(stream, context, "(parsing)")
+            obj = self._parsereport(stream, context, "(parsing)")
         except CancelParsing:
             pass
+        else:
+            layout.validate_references()
+            return obj
 
     def parse_file(self, filename, **contextkw):
         r"""
@@ -462,7 +472,14 @@ class Construct(object):
         context._building = True
         context._sizing = False
         context._params = context
+        layout = _RelocationLayout()
+        context._layout = layout
+        try:
+            layout.start = stream_tell(stream, "(building)")
+        except StreamError:
+            layout.start = None
         self._build(obj, stream, context, "(building)")
+        layout.run_build_passes(self, obj, stream, context)
 
     def build_file(self, obj, filename, **contextkw):
         r"""
@@ -4681,6 +4698,282 @@ class Tell(Construct):
 
     def _emitbuild(self, code):
         return "io.tell()"
+
+
+class _RelocationRecord(object):
+    # Tracks sections and offset fields of one stream during one parse, or one build pass.
+    __slots__ = ("stream", "sections", "patches", "references", "values", "patchcount")
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.sections = {}
+        self.patches = []
+        self.references = []
+        self.values = []
+        self.patchcount = 0
+
+    def begin_pass(self):
+        self.sections = {}
+        self.patches = []
+        self.patchcount = 0
+
+    def compute_values(self, path):
+        values = []
+        for (section, relative, position, end, written) in self.patches:
+            if section not in self.sections:
+                raise RelocationError("OffsetField references section %r which was not found in the same stream" % (section,), path=path)
+            offset = self.sections[section][0]
+            values.append(offset - end if relative else offset)
+        return values
+
+
+class _RelocationLayout(object):
+    # Shared state between Section and OffsetField, created by parse_stream and build_stream.
+    def __init__(self):
+        self.records = {}
+        self.start = None
+
+    def record_for(self, stream):
+        key = id(stream)
+        rec = self.records.get(key)
+        if rec is None or rec.stream is not stream:
+            rec = _RelocationRecord(stream)
+            self.records[key] = rec
+        return rec
+
+    def run_build_passes(self, sc, obj, stream, context):
+        path = "(building)"
+        main = None
+        for rec in self.records.values():
+            if not rec.patches:
+                continue
+            if rec.stream is stream:
+                main = rec
+            else:
+                raise RelocationError("OffsetField is only supported on the outermost seekable stream, not inside Prefixed or Tunnel substreams", path=path)
+        if main is None:
+            return
+        if self.start is None:
+            raise StreamError("OffsetField requires a seekable output stream", path=path)
+        seen = set()
+        max_end = stream_tell(stream, path)
+        for iteration in range(100):
+            new_values = main.compute_values(path)
+            if new_values == [patch[4] for patch in main.patches]:
+                break
+            key = tuple(new_values)
+            if key in seen:
+                raise RelocationError("section layout does not converge, circular dependency between offset fields and section positions", path=path)
+            seen.add(key)
+            main.values = new_values
+            main.begin_pass()
+            stream_seek(stream, self.start, 0, path)
+            sc._build(obj, stream, context, path)
+            max_end = max(max_end, stream_tell(stream, path))
+        else:
+            raise RelocationError("section layout did not converge after 100 passes", path=path)
+        end = stream_tell(stream, path)
+        if end < max_end:
+            try:
+                stream.truncate(end)
+            except Exception:
+                raise StreamError("stream.truncate() failed, cannot remove stale bytes from a previous layout pass", path=path)
+
+    def validate_references(self):
+        for rec in self.records.values():
+            for (section, target, path) in rec.references:
+                if section not in rec.sections:
+                    raise RelocationError("OffsetField references section %r which was not found in the same stream" % (section,), path=path)
+                offset, end = rec.sections[section]
+                if target is None or offset is None or end is None:
+                    continue
+                if not (offset <= target <= end):
+                    raise RelocationError("offset %d does not point into section %r which occupies %d..%d" % (target, section, offset, end), path=path)
+
+
+def _layout_of(context):
+    params = context.get("_params", None)
+    if params is None:
+        return None
+    return params.get("_layout", None)
+
+
+class Section(Subconstruct):
+    r"""
+    A named region of the stream whose final offset can be referenced by :class:`~construct.core.OffsetField` fields. The section name doubles as the field name, so the parsed value is inserted into the context under the same name that offset fields refer to.
+
+    Parsing and building defer to the subcon, but first the stream is padded (with `padpattern` bytes when building) so that the section starts at an absolute stream position that is a multiple of `alignment`. The actual offset and end position of the section are recorded, so that OffsetField fields (even ones parsed or built before this section, so called forward references) can be filled in and validated. Section names must be unique within a stream, and nested sections are allowed.
+
+    Note that building a format that contains offset fields requires a seekable output stream, because the layout is recomputed in multiple passes until all offsets converge. Parsing validates that each offset field actually points into the referenced section.
+
+    :param name: string, section identifier used by OffsetField fields, also used as the field name
+    :param subcon: Construct instance
+    :param alignment: optional, integer or context lambda, the section starts at a multiple of this, default is 1 (no alignment)
+    :param padpattern: optional, b-character, padding pattern used when building, default is \\x00
+
+    :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
+    :raises PaddingError: alignment was not a positive integer, or pattern is not bytes of length 1
+    :raises RelocationError: section name is not a non-empty string, or another section with the same name was already processed in the same stream
+
+    Can propagate any exception from the lambda, possibly non-ConstructError.
+
+    Example::
+
+        >>> d = Struct(
+        ...     "offset" / OffsetField("data", Byte),
+        ...     Section("data", Bytes(2), alignment=4),
+        ... )
+        >>> d.build(dict(data=b"ab"))
+        b'\x04\x00\x00\x00ab'
+        >>> d.parse(_)
+        Container(offset=4, data=b'ab')
+    """
+
+    def __init__(self, name, subcon, alignment=1, padpattern=b"\x00"):
+        if not isinstance(name, str) or not name:
+            raise RelocationError("section name must be a non-empty string")
+        if not isinstance(padpattern, bytes) or len(padpattern) != 1:
+            raise PaddingError("padpattern expected to be bytes of length 1")
+        super().__init__(subcon)
+        self.name = name
+        self.alignment = alignment
+        self.padpattern = padpattern
+
+    def _parse(self, stream, context, path):
+        alignment = evaluate(self.alignment, context)
+        if not isinstance(alignment, int) or alignment < 1:
+            raise PaddingError("alignment must be a positive integer", path=path)
+        if alignment > 1:
+            position = stream_tell(stream, path)
+            pad = -position % alignment
+            stream_read(stream, pad, path)
+        layout = _layout_of(context)
+        rec = layout.record_for(stream) if layout is not None else None
+        if rec is not None:
+            if self.name in rec.sections:
+                raise RelocationError("duplicate section name %r in the same stream" % (self.name,), path=path)
+            try:
+                offset = stream_tell(stream, path)
+            except StreamError:
+                offset = None
+            rec.sections[self.name] = [offset, None]
+        obj = self.subcon._parsereport(stream, context, path)
+        if rec is not None:
+            try:
+                rec.sections[self.name][1] = stream_tell(stream, path)
+            except StreamError:
+                pass
+        return obj
+
+    def _build(self, obj, stream, context, path):
+        layout = _layout_of(context)
+        if layout is None:
+            raise RelocationError("Section must be built using build/build_stream/build_file entry points", path=path)
+        alignment = evaluate(self.alignment, context)
+        if not isinstance(alignment, int) or alignment < 1:
+            raise PaddingError("alignment must be a positive integer", path=path)
+        rec = layout.record_for(stream)
+        if alignment > 1:
+            position = stream_tell(stream, path)
+            pad = -position % alignment
+            stream_write(stream, self.padpattern * pad, pad, path)
+        offset = stream_tell(stream, path)
+        if self.name in rec.sections:
+            raise RelocationError("duplicate section name %r in the same stream" % (self.name,), path=path)
+        rec.sections[self.name] = [offset, None]
+        buildret = self.subcon._build(obj, stream, context, path)
+        rec.sections[self.name][1] = stream_tell(stream, path)
+        return buildret
+
+    def _sizeof(self, context, path):
+        try:
+            alignment = evaluate(self.alignment, context)
+        except (KeyError, AttributeError):
+            raise SizeofError("cannot calculate size, key not found in context", path=path)
+        if alignment != 1:
+            raise SizeofError("section offset depends on stream position, size is not fixed", path=path)
+        return self.subcon._sizeof(context, path)
+
+
+class OffsetField(Construct):
+    r"""
+    A field that stores the offset of a :class:`~construct.core.Section`, computed from the final layout when building. This removes the need to compute header offsets by hand before building.
+
+    Parsing defers to the subcon and returns the parsed integer as-is, but the referenced range is validated: the offset (plus the position right after this field, if relative) must point into the byte range occupied by the referenced section in the same stream. Building ignores the given value (like :class:`~construct.core.Rebuild` does) and writes the offset of the referenced section, absolute or relative to the position right after this field. Multiple offset fields can reference the same section, and sections can be nested.
+
+    The subcon is usually an integer field, and it can be a variable-length one (like :class:`~construct.core.VarInt`). Since the field length influences the layout, building iterates in multiple passes until all offsets converge. Building raises an error (instead of producing a silently corrupt file) when an offset does not fit into its field, when the referenced section is missing, when the layout oscillates due to a circular dependency, or when the output stream is not seekable.
+
+    :param section: string, name of the referenced Section
+    :param subcon: Construct instance, an integer field used for storing the offset
+    :param relative: optional, bool, whether the offset is relative to the position right after this field, default is False (absolute)
+
+    :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
+    :raises StreamError: output stream is not seekable
+    :raises RelocationError: offset does not fit into the field, section is missing or duplicated, layout does not converge, or parsed offset does not point into the referenced section
+
+    Example::
+
+        >>> d = Struct(
+        ...     "offset" / OffsetField("data", Int16ub),
+        ...     Section("data", GreedyBytes),
+        ... )
+        >>> d.build(dict(data=b"abc"))
+        b'\x00\x02abc'
+        >>> d.parse(_)
+        Container(offset=2, data=b'abc')
+
+        >>> d = Struct(
+        ...     "offset" / OffsetField("data", Byte, relative=True),
+        ...     Section("data", Bytes(2)),
+        ... )
+        >>> d.build(dict(data=b"ab"))
+        b'\x00ab'
+    """
+
+    def __init__(self, section, subcon, relative=False):
+        if not isinstance(section, str) or not section:
+            raise RelocationError("section name must be a non-empty string")
+        if not isinstance(subcon, Construct):
+            raise TypeError("subcon should be a Construct field")
+        super().__init__()
+        self.section = section
+        self.subcon = subcon
+        self.relative = relative
+        self.flagbuildnone = True
+
+    def _parse(self, stream, context, path):
+        value = self.subcon._parsereport(stream, context, path)
+        layout = _layout_of(context)
+        if layout is not None:
+            rec = layout.record_for(stream)
+            try:
+                end = stream_tell(stream, path)
+                target = (end + value) if self.relative else value
+            except StreamError:
+                target = None
+            rec.references.append((self.section, target, path))
+        return value
+
+    def _build(self, obj, stream, context, path):
+        layout = _layout_of(context)
+        if layout is None:
+            raise RelocationError("OffsetField must be built using build/build_stream/build_file entry points", path=path)
+        rec = layout.record_for(stream)
+        index = rec.patchcount
+        rec.patchcount += 1
+        value = rec.values[index] if index < len(rec.values) else 0
+        position = stream_tell(stream, path)
+        try:
+            self.subcon._build(value, stream, context, path)
+        except ConstructError as e:
+            raise RelocationError("offset %r for section %r does not fit into the field (%s)" % (value, self.section, e), path=path)
+        end = stream_tell(stream, path)
+        rec.patches.append((self.section, self.relative, position, end, value))
+        return value
+
+    def _sizeof(self, context, path):
+        return self.subcon._sizeof(context, path)
+
 
 
 @singleton
