@@ -1533,6 +1533,64 @@ def test_lazystruct():
     assert d.build(Container(obj)) == b"\x00\x00\x01\x00\x02\x00\x01\x00"
     assert raises(d.sizeof) == SizeofError
 
+def test_lazystruct_detach():
+    import io
+
+    class TrackingStream(io.BytesIO):
+        def __init__(self, data):
+            super().__init__(data)
+            self.intervals = []
+
+        def read(self, size=-1):
+            start = self.tell()
+            data = super().read(size)
+            if data:
+                self.intervals.append((start, start + len(data)))
+            return data
+
+    class CustomFixedField(Construct):
+        def _parse(self, stream, context, path):
+            return stream_read(stream, 1, path)
+
+        def _sizeof(self, context, path):
+            return 1
+
+    data = b"\x03abc" + b"X" * 20 + b"\x05" + b"HELLO" + b"!!!"
+    d = LazyStruct(
+        "length" / Byte,
+        "payload" / Bytes(this.length),
+        "unused_large" / Bytes(20),
+        "nested_length" / Byte,
+        "nested" / LazyStruct(
+            "message" / Bytes(this._.nested_length),
+            "unused_nested" / Bytes(3),
+        ),
+    )
+    stream = TrackingStream(data)
+    obj = d.parse_stream(stream)
+    assert stream.intervals == [(0, 1), (24, 25)]
+
+    stream.seek(7)
+    stream.intervals.clear()
+    detached = obj.detach("payload", ("nested", "message"))
+    assert stream.intervals == [(1, 4), (25, 30)]
+    assert stream.tell() == 7
+
+    assert detached.payload == b"abc"
+    assert stream.tell() == 7
+    assert detached._stream.tell() == 0
+    assert obj.payload == b"abc"
+    assert stream.tell() == 7
+    assert detached._stream.tell() == 0
+
+    stream.close()
+    assert detached.payload == b"abc"
+    assert detached.nested.message == b"HELLO"
+
+    custom = LazyStruct("custom" / CustomFixedField())
+    custom_obj = custom.parse(b"x")
+    assert raises(custom_obj.detach, "custom") == DetachError
+
 def test_lazyarray():
     d = LazyArray(5, Int8ub)
     obj = d.parse(b"\x00\x01\x02\x03\x04")

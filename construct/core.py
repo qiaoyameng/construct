@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-import struct, io, binascii, itertools, collections, pickle, sys, os, hashlib, importlib, importlib.machinery, importlib.util
+import struct, io, binascii, itertools, collections, functools, pickle, sys, os, hashlib, importlib, importlib.machinery, importlib.util, types
 
 from construct.lib import *
 from construct.expr import *
@@ -154,6 +154,12 @@ class CancelParsing(ConstructError):
 class CipherError(ConstructError):
     """
     Two parsing classes can raise this exception: EncryptedSym EncryptedSymAead. It can mean none or invalid cipher object was provided.
+    """
+    pass
+
+class DetachError(ConstructError):
+    """
+    Raised when a LazyContainer cannot be detached with only the selected fields.
     """
     pass
 
@@ -5926,10 +5932,11 @@ class Lazy(Subconstruct):
         offset = stream_tell(stream, path)
         def execute():
             fallback = stream_tell(stream, path)
-            stream_seek(stream, offset, 0, path)
-            obj = self.subcon._parsereport(stream, context, path)
-            stream_seek(stream, fallback, 0, path)
-            return obj
+            try:
+                stream_seek(stream, offset, 0, path)
+                return self.subcon._parsereport(stream, context, path)
+            finally:
+                stream_seek(stream, fallback, 0, path)
         len = self.subcon._actualsize(stream, context, path)
         stream_seek(stream, len, 1, path)
         return execute
@@ -5938,6 +5945,461 @@ class Lazy(Subconstruct):
         if callable(obj):
             obj = obj()
         return self.subcon._build(obj, stream, context, path)
+
+
+class _DetachedStream(io.BufferedIOBase):
+    def __init__(self, ranges, size):
+        self._ranges = ranges
+        self._size = size
+        self._pos = 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def writable(self):
+        return False
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_SET:
+            pos = offset
+        elif whence == io.SEEK_CUR:
+            pos = self._pos + offset
+        elif whence == io.SEEK_END:
+            pos = self._size + offset
+        else:
+            raise StreamError("invalid seek whence %s" % (whence,))
+        if not 0 <= pos <= self._size:
+            raise StreamError("seek position %s is outside detached stream" % (pos,))
+        self._pos = pos
+        return pos
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            end = self._next_gap(self._pos)
+            if end is None:
+                end = self._size
+            size = end - self._pos
+        if size == 0:
+            return b""
+        data = bytearray()
+        remaining = size
+        pos = self._pos
+        while remaining:
+            piece = None
+            for start, end, chunk in self._ranges:
+                if start <= pos < end:
+                    next_pos = min(pos + remaining, end)
+                    piece = chunk[pos-start:next_pos-start]
+                    pos = next_pos
+                    break
+            if piece is None:
+                raise StreamError("detached stream does not contain byte at %s" % (pos,))
+            data.extend(piece)
+            remaining -= len(piece)
+        self._pos = pos
+        return bytes(data)
+
+    def readinto(self, buffer):
+        data = self.read(len(buffer))
+        buffer[:len(data)] = data
+        return len(data)
+
+    def _next_gap(self, pos):
+        covered = pos
+        while True:
+            for start, end, chunk in self._ranges:
+                if start == covered:
+                    covered = end
+                    break
+            else:
+                return None if covered == self._size else covered
+
+
+_DETACH_NESTING_CLASSES = {"Struct", "Sequence", "FocusedSeq", "Union", "LazyStruct"}
+_DETACH_UNSAFE_CLASSES = {"Peek", "Union", "RestreamData", "OffsettedEnd", "NullStripped"}
+
+
+def _detach_path_parts(path):
+    parts = []
+    while isinstance(path, Path):
+        parts.append(path.__dict__["_Path__field"])
+        parent = path.__dict__["_Path__parent"]
+        if path.__dict__["_Path__name"] != "this":
+            parts.append(path.__dict__["_Path__name"])
+        path = parent
+    parts.reverse()
+    return tuple(part for part in parts if part is not None)
+
+
+def _detach_callable_references(func):
+    if isinstance(func, Path):
+        return [_detach_path_parts(func)]
+    if isinstance(func, FuncPath):
+        operand = func.__dict__.get("_FuncPath__operand")
+        return _detach_callable_references(operand) if operand is not None else []
+    if isinstance(func, (types.BuiltinFunctionType, type)):
+        return []
+    if isinstance(func, functools.partial):
+        references = _detach_callable_references(func.func)
+        for value in func.args:
+            if callable(value):
+                references.extend(_detach_callable_references(value))
+        for value in func.keywords.values():
+            if callable(value):
+                references.extend(_detach_callable_references(value))
+        return references
+    if not isinstance(func, types.FunctionType):
+        return []
+
+    import dis
+    references = []
+    chain = None
+    for instruction in dis.get_instructions(func):
+        if instruction.opname in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK") and instruction.arg == 0:
+            chain = []
+        elif chain is not None and instruction.opname in ("LOAD_ATTR", "LOAD_METHOD"):
+            chain.append(instruction.argval)
+        else:
+            if chain:
+                references.append(tuple(chain))
+            chain = None
+    if chain:
+        references.append(tuple(chain))
+    try:
+        names = func.__code__.co_names
+    except AttributeError:
+        names = ()
+    references.extend((name,) for name in names)
+    references.extend(
+        (name,)
+        for name in getattr(func, "__code__", types.SimpleNamespace(co_consts=())).co_consts
+        if isinstance(name, str) and name.isidentifier()
+    )
+    return references
+
+
+def _detach_ensure_safe(construct, path, seen=None):
+    if seen is None:
+        seen = set()
+    if id(construct) in seen:
+        return
+    seen.add(id(construct))
+
+    if not isinstance(construct, Construct):
+        return
+    if type(construct).__module__ != __name__:
+        raise DetachError("cannot safely detach custom construct %r" % (construct,), path=path)
+    if type(construct).__name__ in _DETACH_UNSAFE_CLASSES:
+        raise DetachError("cannot safely detach field using %r" % (construct,), path=path)
+
+    if type(construct).__name__ in _DETACH_NESTING_CLASSES:
+        for child in getattr(construct, "subcons", ()):
+            _detach_ensure_safe(child, path, seen)
+
+    for value in vars(construct).values():
+        if isinstance(value, Construct) and id(value) not in seen:
+            _detach_ensure_safe(value, path, seen)
+
+
+def _detach_construct_references(construct, seen=None):
+    if seen is None:
+        seen = set()
+    if id(construct) in seen:
+        return
+    seen.add(id(construct))
+
+    nesting = type(construct).__name__ in _DETACH_NESTING_CLASSES
+    children = getattr(construct, "subcons", ()) if nesting else ()
+    for child in children:
+        for reference in _detach_construct_references(child, seen):
+            if reference and reference[0] == "_":
+                yield reference[1:]
+            elif reference and reference[0] == "_root":
+                yield reference
+
+    for key, value in vars(construct).items():
+        if key == "subcons" or key.startswith("_") or key in ("parsed", "docs"):
+            continue
+        if isinstance(value, Construct):
+            yield from _detach_construct_references(value, seen)
+        elif callable(value):
+            yield from _detach_callable_references(value)
+
+
+class _DetachLevel:
+    def __init__(self, container, parent=None):
+        self.container = container
+        self.parent = parent
+        self.children = {}
+        self.requests = set()
+        self.pointers = set()
+        self.detached = None
+
+    def index(self, name):
+        if isinstance(name, int):
+            if not 0 <= name < len(self.container._struct.subcons):
+                raise DetachError("field index %s does not exist" % (name,))
+            return name
+        try:
+            return self.container._struct._subconsindexes[name]
+        except KeyError:
+            raise DetachError("field %r does not exist" % (name,))
+
+    def field_name(self, index):
+        return self.container._struct.subcons[index].name
+
+
+def _detach_unwrap(construct):
+    while isinstance(construct, Renamed):
+        construct = construct.subcon
+    return construct
+
+
+def _detach_add_range(ranges, start, end):
+    if start > end:
+        raise DetachError("invalid detached byte range %s:%s" % (start, end))
+    if start == end:
+        return
+    ranges.append((start, end))
+
+
+def _detach_merge_ranges(ranges):
+    if not ranges:
+        return []
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _detach_contains_lazy(value, seen=None):
+    if seen is None:
+        seen = set()
+    if id(value) in seen:
+        return False
+    seen.add(id(value))
+    if isinstance(value, (LazyContainer, LazyListContainer)) or callable(value):
+        return True
+    if isinstance(value, (Container, dict)):
+        return any(
+            not (isinstance(key, str) and key.startswith("_"))
+            and _detach_contains_lazy(item, seen)
+            for key, item in dict.items(value)
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_detach_contains_lazy(item, seen) for item in value)
+    return False
+
+
+def _detach_field_range(container, index):
+    return container._offsets[index], container._offsets[index+1]
+
+
+def _detach_resolve(level, reference, root_level):
+    current = level
+    parts = list(reference)
+    while parts and parts[0] == "_":
+        if current.parent is None:
+            raise DetachError("cannot detach reference %r outside LazyStruct" % (reference,))
+        current = current.parent
+        parts.pop(0)
+    if parts and parts[0] == "_root":
+        current = root_level
+        parts = parts[1:]
+    if not parts:
+        return None, ()
+    if parts[0] not in current.container._struct._subconsindexes and not isinstance(parts[0], int):
+        return None, ()
+    return current, tuple(parts)
+
+
+def _detach_request(level, path, root_level, ranges):
+    index = level.index(path[0])
+    construct = level.container._struct.subcons[index]
+    _detach_ensure_safe(construct, level.container._path)
+
+    if len(path) == 1:
+        level.requests.add((index,))
+        cached = level.container._values.get(index)
+        if index not in level.container._values or _detach_contains_lazy(cached):
+            start, end = _detach_field_range(level.container, index)
+            _detach_add_range(ranges, start, end)
+        actual = _detach_unwrap(construct)
+        if isinstance(actual, Pointer):
+            level.pointers.add(index)
+    else:
+        value = level.container[index]
+        if not isinstance(value, LazyContainer):
+            raise DetachError("nested path %r does not select a LazyStruct field" % (path,))
+        if value._stream is not level.container._stream:
+            raise DetachError("cannot detach nested path %r through a field substream" % (path,))
+        child = level.children.get(index)
+        if child is None:
+            child = _DetachLevel(value, level)
+            level.children[index] = child
+        _detach_request(child, path[1:], root_level, ranges)
+
+    for reference in _detach_construct_references(construct):
+        target, target_path = _detach_resolve(level, reference, root_level)
+        if target is not None:
+            _detach_request(target, target_path, root_level, ranges)
+
+
+def _detach_materialize(level, path):
+    index = level.index(path[0])
+    value = level.container[index]
+    if len(path) > 1:
+        child = level.children[index]
+        return _detach_materialize(child, path[1:])
+    name = level.field_name(index)
+    if name:
+        level.container._context[name] = value
+    return value
+
+
+def _detach_pointer_ranges(level, root_level, ranges):
+    for index in level.pointers:
+        for reference in _detach_construct_references(level.container._struct.subcons[index]):
+            target, path = _detach_resolve(level, reference, root_level)
+            if target is not None:
+                _detach_materialize(target, path)
+
+        pointer = _detach_unwrap(level.container._struct.subcons[index])
+        stream = level.container._stream
+        context = level.container._context
+        target_stream = evaluate(pointer.stream, context) if callable(pointer.stream) else pointer.stream
+        if target_stream is not None and target_stream is not stream:
+            raise DetachError("cannot detach Pointer that uses another stream", path=level.container._path)
+
+        offset = evaluate(pointer.offset, context)
+        fallback = stream_tell(stream, level.container._path)
+        field_start = level.container._offsets[index]
+        try:
+            if pointer.relativeOffset:
+                start = field_start + offset
+                stream_seek(stream, field_start, 0, level.container._path)
+            elif offset < 0:
+                size = stream_seek(stream, 0, 2, level.container._path)
+                start = size + offset
+                stream_seek(stream, start, 0, level.container._path)
+            else:
+                start = offset
+                stream_seek(stream, start, 0, level.container._path)
+            try:
+                length = pointer.subcon._actualsize(stream, context, level.container._path)
+            except SizeofError:
+                raise DetachError("cannot determine bytes needed by Pointer target %r" % (pointer.subcon,), path=level.container._path)
+            _detach_add_range(ranges, start, start + length)
+        finally:
+            stream_seek(stream, fallback, 0, level.container._path)
+
+    for child in level.children.values():
+        _detach_pointer_ranges(child, root_level, ranges)
+
+
+def _detach_clone_context(old, stream, mapping=None):
+    if mapping is None:
+        mapping = {}
+    if id(old) in mapping:
+        return mapping[id(old)]
+    if not isinstance(old, Container):
+        return old
+
+    parent = _detach_clone_context(getattr(old, "_", None), stream, mapping)
+    new = Container()
+    old_root = getattr(old, "_root", old)
+    for key, value in dict.items(old):
+        if key in ("_", "_io", "_root") or _detach_contains_lazy(value):
+            continue
+        new[key] = value
+    new._ = parent
+    new._io = stream
+    if isinstance(getattr(old, "_params", None), Container):
+        new._params = mapping.get(id(old._params), old._params)
+    mapping[id(old)] = new
+    new._root = mapping.get(id(old_root), old_root)
+    return new
+
+
+def _detach_build_level(level, stream, mapping=None):
+    is_root = mapping is None
+    if is_root:
+        mapping = {}
+    context = _detach_clone_context(level.container._context, stream, mapping)
+    if is_root:
+        context._root = context
+        parent = context._
+        while isinstance(parent, Container):
+            if getattr(parent, "_root", None) is level.container._context:
+                parent._root = context
+            parent = getattr(parent, "_", None)
+    values = {
+        index: value
+        for index, value in level.container._values.items()
+        if not _detach_contains_lazy(value)
+    }
+    for index, child in level.children.items():
+        child_container = _detach_build_level(child, stream, mapping)
+        values[index] = child_container
+        name = level.field_name(index)
+        if name:
+            context[name] = child_container
+
+    detached = LazyContainer(
+        level.container._struct,
+        stream,
+        dict(level.container._offsets),
+        values,
+        context,
+        level.container._path,
+    )
+    level.detached = detached
+
+    for request in sorted(level.requests):
+        index = request[0]
+        if index not in level.children:
+            value = detached[index]
+            name = level.field_name(index)
+            if name:
+                context[name] = value
+
+    for index, child in level.children.items():
+        name = level.field_name(index)
+        if name:
+            context[name] = child.detached
+
+    return detached
+
+
+def _lazystruct_parse_dependencies(struct, stream, context, path, index, values, offsets, pending=None):
+    if pending is None:
+        pending = set()
+    for reference in _detach_construct_references(struct.subcons[index]):
+        if not reference or reference[0] in ("_", "_root"):
+            continue
+        name = reference[0]
+        if name not in struct._subconsindexes:
+            continue
+        dependency = struct._subconsindexes[name]
+        if dependency >= index or dependency in values or dependency in pending:
+            continue
+        pending.add(dependency)
+        _lazystruct_parse_dependencies(struct, stream, context, path, dependency, values, offsets, pending)
+        stream_seek(stream, offsets[dependency], 0, path)
+        value = struct.subcons[dependency]._parsereport(stream, context, path)
+        values[dependency] = value
+        if struct.subcons[dependency].name:
+            context[struct.subcons[dependency].name] = value
+        pending.remove(dependency)
 
 
 class LazyContainer(dict):
@@ -5961,10 +6423,14 @@ class LazyContainer(dict):
             index = self._struct._subconsindexes[index] # KeyError
         if index in self._values:
             return self._values[index]
-        stream_seek(self._stream, self._offsets[index], 0, self._path) # KeyError
-        parseret = self._struct.subcons[index]._parsereport(self._stream, self._context, self._path)
-        self._values[index] = parseret
-        return parseret
+        fallback = stream_tell(self._stream, self._path)
+        try:
+            stream_seek(self._stream, self._offsets[index], 0, self._path) # KeyError
+            parseret = self._struct.subcons[index]._parsereport(self._stream, self._context, self._path)
+            self._values[index] = parseret
+            return parseret
+        finally:
+            stream_seek(self._stream, fallback, 0, self._path)
 
     def __len__(self):
         return len(self._struct.subcons)
@@ -5985,6 +6451,49 @@ class LazyContainer(dict):
 
     def __repr__(self):
         return "<LazyContainer: %s items cached, %s subcons>" % (len(self._values), len(self._struct.subcons), )
+
+    def detach(self, *fields):
+        r"""
+        Create an independent LazyContainer backed by a sparse in-memory stream.
+
+        Fields are selected by name, index, or a tuple/list path. Only the selected byte ranges and fields referenced by their lengths, counts, offsets, and conditions are copied. Nested fields are selected using tuple paths, for example ``("header", "name")``.
+
+        Custom constructs that cannot be proven to remain within a selectable byte range raise DetachError.
+        """
+        if not fields:
+            raise DetachError("detach() requires at least one field", path=self._path)
+
+        paths = []
+        for field in fields:
+            if isinstance(field, tuple):
+                path = field
+            elif isinstance(field, list):
+                path = tuple(field)
+            else:
+                path = (field,)
+            if not path:
+                raise DetachError("detach() received an empty field path", path=self._path)
+            paths.append(path)
+
+        root = _DetachLevel(self)
+        ranges = []
+        fallback = stream_tell(self._stream, self._path)
+        try:
+            for path in paths:
+                _detach_request(root, path, root, ranges)
+            _detach_pointer_ranges(root, root, ranges)
+
+            stream_seek(self._stream, 0, 2, self._path)
+            size = stream_tell(self._stream, self._path)
+            copied = []
+            for start, end in _detach_merge_ranges(ranges):
+                stream_seek(self._stream, start, 0, self._path)
+                data = stream_read(self._stream, end-start, self._path)
+                copied.append((start, end, data))
+        finally:
+            stream_seek(self._stream, fallback, 0, self._path)
+
+        return _detach_build_level(root, _DetachedStream(copied, size))
 
 
 class LazyStruct(Construct):
@@ -6030,7 +6539,13 @@ class LazyStruct(Construct):
         values = {}
         for i,sc in enumerate(self.subcons):
             try:
-                offset += sc._actualsize(stream, context, path)
+                try:
+                    size = sc._actualsize(stream, context, path)
+                except SizeofError:
+                    _lazystruct_parse_dependencies(self, stream, context, path, i, values, offsets)
+                    stream_seek(stream, offset, 0, path)
+                    size = sc._actualsize(stream, context, path)
+                offset += size
                 stream_seek(stream, offset, 0, path)
             except SizeofError:
                 parseret = sc._parsereport(stream, context, path)
@@ -6092,10 +6607,14 @@ class LazyListContainer(list):
             return [self[i] for i in range(*index.indices(self._count))]
         if index in self._values:
             return self._values[index]
-        stream_seek(self._stream, self._offsets[index], 0, self._path) # KeyError
-        parseret = self._subcon._parsereport(self._stream, self._context, self._path)
-        self._values[index] = parseret
-        return parseret
+        fallback = stream_tell(self._stream, self._path)
+        try:
+            stream_seek(self._stream, self._offsets[index], 0, self._path) # KeyError
+            parseret = self._subcon._parsereport(self._stream, self._context, self._path)
+            self._values[index] = parseret
+            return parseret
+        finally:
+            stream_seek(self._stream, fallback, 0, self._path)
 
     def __getslice__(self, start, stop):
         if stop == sys.maxsize:

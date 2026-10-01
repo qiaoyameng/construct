@@ -29,3 +29,4 @@ Core API: Exception types
 .. autofunction:: construct.ChecksumError
 .. autofunction:: construct.CancelParsing
 .. autofunction:: construct.CipherError
+.. autofunction:: construct.DetachError

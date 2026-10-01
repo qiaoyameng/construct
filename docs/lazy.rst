@@ -45,6 +45,16 @@ Note there are restrictions:
 Building and sizeof are greedy, like in ``Struct``.
 
 
+Detached parsing
+---------------
+
+A parsed :class:`LazyStruct` can detach selected fields from the original stream with ``detach()``. Field names, indexes, tuples, and lists select nested lazy fields.
+
+Detaching copies only the selected byte ranges and fields referenced by lengths, counts, offsets, and parse conditions. Unselected fixed-size and prefixed payloads are not read. The detached object uses a sparse in-memory stream, so the original stream can be closed afterwards.
+
+Accessing either the original or detached lazy object restores the stream position after parsing. A custom construct is rejected with ``DetachError`` when its required byte range cannot be proven safe.
+
+
 LazyArray
 ---------------
 
