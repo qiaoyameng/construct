@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-import struct, io, binascii, itertools, collections, pickle, sys, os, hashlib, importlib, importlib.machinery, importlib.util
+import struct, io, binascii, itertools, collections, pickle, sys, os, hashlib, importlib, importlib.machinery, importlib.util, ast, inspect
 
 from construct.lib import *
 from construct.expr import *
@@ -157,6 +157,12 @@ class CipherError(ConstructError):
     """
     pass
 
+class DetachError(ConstructError):
+    """
+    Raised by LazyContainer.detach when a selected field cannot be made independent from its source stream.
+    """
+    pass
+
 
 
 #===============================================================================
@@ -256,6 +262,75 @@ class BytesIOWithOffsets(io.BytesIO):
         else:
             super().seek(offset - self.parent_stream_offset)
         return self.tell()
+
+
+class SparseBytesIO(io.RawIOBase):
+    def __init__(self, size):
+        self._size = size
+        self._chunks = []
+        self._position = 0
+
+    def add_chunk(self, offset, data):
+        self._chunks.append((offset, bytes(data)))
+        self._chunks.sort()
+        merged = []
+        for chunk_offset, chunk_data in self._chunks:
+            if not merged or chunk_offset > merged[-1][0] + len(merged[-1][1]):
+                merged.append((chunk_offset, chunk_data))
+            elif chunk_offset + len(chunk_data) > merged[-1][0] + len(merged[-1][1]):
+                previous_offset, previous_data = merged[-1]
+                overlap = previous_offset + len(previous_data) - chunk_offset
+                merged[-1] = (previous_offset, previous_data + chunk_data[overlap:])
+        self._chunks = merged
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._position
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_SET:
+            position = offset
+        elif whence == io.SEEK_CUR:
+            position = self._position + offset
+        elif whence == io.SEEK_END:
+            position = self._size + offset
+        else:
+            raise ValueError("invalid whence")
+        if position < 0:
+            raise ValueError("negative seek position")
+        self._position = position
+        return position
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = self._size - self._position
+        if size == 0 or self._position >= self._size:
+            return b""
+
+        end = min(self._position + size, self._size)
+        chunks = []
+        position = self._position
+        for chunk_offset, chunk_data in self._chunks:
+            chunk_end = chunk_offset + len(chunk_data)
+            if chunk_end <= position:
+                continue
+            if chunk_offset >= end:
+                break
+            if chunk_offset > position:
+                break
+            chunks.append(chunk_data[position-chunk_offset:end-chunk_offset])
+            position = min(end, chunk_end)
+            if position >= end:
+                break
+
+        data = b"".join(chunks)
+        self._position += len(data)
+        return data
 
 
 class CodeGen:
@@ -5943,13 +6018,14 @@ class Lazy(Subconstruct):
 class LazyContainer(dict):
     """Used internally."""
 
-    def __init__(self, struct, stream, offsets, values, context, path):
+    def __init__(self, struct, stream, offsets, values, context, path, dependencies=None):
         self._struct = struct
         self._stream = stream
         self._offsets = offsets
         self._values = values
         self._context = context
         self._path = path
+        self._dependencies = dependencies or {}
 
     def __getattr__(self, name):
         if name in self._struct._subconsindexes:
@@ -5961,10 +6037,37 @@ class LazyContainer(dict):
             index = self._struct._subconsindexes[index] # KeyError
         if index in self._values:
             return self._values[index]
-        stream_seek(self._stream, self._offsets[index], 0, self._path) # KeyError
-        parseret = self._struct.subcons[index]._parsereport(self._stream, self._context, self._path)
-        self._values[index] = parseret
-        return parseret
+        fallback = stream_tell(self._stream, self._path)
+        try:
+            self._materialize_dependencies(index)
+            field_offset = self._offsets[index]
+            if field_offset is None:
+                field_offset = stream_size(self._stream)
+            stream_seek(self._stream, field_offset, 0, self._path) # KeyError
+            parseret = self._struct.subcons[index]._parsereport(self._stream, self._context, self._path)
+            self._values[index] = parseret
+            sc = self._struct.subcons[index]
+            if sc.name:
+                self._context[sc.name] = parseret
+            return parseret
+        finally:
+            stream_seek(self._stream, fallback, 0, self._path)
+
+    def _materialize_dependencies(self, index, seen=None):
+        if seen is None:
+            seen = set()
+        if index in seen:
+            return
+        seen.add(index)
+        for dependency in self._dependencies.get(index, ()):
+            if not isinstance(dependency, int):
+                continue
+            dependency_sc = self._struct.subcons[dependency]
+            if dependency_sc.name and dependency_sc.name in self._context:
+                continue
+            if dependency >= index:
+                continue
+            self[dependency]
 
     def __len__(self):
         return len(self._struct.subcons)
@@ -5986,6 +6089,315 @@ class LazyContainer(dict):
     def __repr__(self):
         return "<LazyContainer: %s items cached, %s subcons>" % (len(self._values), len(self._struct.subcons), )
 
+    def detach(self, *fields):
+        r"""
+        Copy selected fields and their required context dependencies into an independent lazy container.
+
+        The returned container uses an in-memory sparse stream, so the original stream can be closed. Unselected fields and trailing greedy data are not copied. Fields that move outside their own byte range or use opaque custom parsing raise DetachError.
+
+        :param \*fields: field names, or one iterable of field names
+        :returns: LazyContainer
+        :raises DetachError: requested field or dependency cannot be detached safely
+        """
+        if len(fields) == 1 and not isinstance(fields[0], str) and hasattr(fields[0], "__iter__"):
+            fields = tuple(fields[0])
+
+        selected = set()
+        for field in fields:
+            if field not in self._struct._subconsindexes:
+                raise DetachError("field %r does not exist" % (field,), path=self._path)
+            selected.add(self._struct._subconsindexes[field])
+
+        required = set()
+        for index in selected:
+            required.add(index)
+            self._collect_dependencies(index, required)
+
+        fallback = stream_tell(self._stream, self._path)
+        try:
+            detached_stream = SparseBytesIO(stream_size(self._stream))
+            context = _clone_lazy_context(self._context, detached_stream)
+
+            for key in list(context):
+                if not key.startswith("_"):
+                    del context[key]
+
+            for index in sorted(required - selected):
+                sc = self._struct.subcons[index]
+                start = self._offsets[index]
+                end = self._offsets[index+1]
+                if start is None or end is None:
+                    continue
+                stream_seek(self._stream, start, 0, self._path)
+                detached_stream.add_chunk(start, stream_read(self._stream, end-start, self._path))
+                if sc.name and sc.name not in context:
+                    value = self._values[index] if index in self._values else self[index]
+                    if isinstance(value, (LazyContainer, LazyListContainer)) or callable(value):
+                        raise DetachError("dependency %r cannot be detached safely" % (sc.name,), path=self._path)
+                    context[sc.name] = value
+                elif sc.name:
+                    value = context[sc.name]
+                    if isinstance(value, (LazyContainer, LazyListContainer)) or callable(value):
+                        raise DetachError("dependency %r cannot be detached safely" % (sc.name,), path=self._path)
+
+            values = {}
+            for index in selected:
+                sc = self._struct.subcons[index]
+                pointer = _unwrap_renamed(sc)
+                if isinstance(pointer, Pointer):
+                    self._detach_pointer(pointer, context, detached_stream, self._offsets[index] if self._offsets[index] is not None else stream_tell(self._stream, self._path))
+                else:
+                    reason = _unsupported_detach_reason(sc)
+                    if reason:
+                        raise DetachError("field %r cannot be detached safely: %s" % (sc.name or index, reason), path=self._path)
+                    start = self._offsets[index]
+                    end = self._offsets[index+1]
+                    if start is None or end is None:
+                        end = stream_size(self._stream)
+                        start = end if start is None else start
+                    elif start < end:
+                        stream_seek(self._stream, start, 0, self._path)
+                        try:
+                            end = start + sc._actualsize(self._stream, context, self._path)
+                        except (SizeofError, KeyError, AttributeError):
+                            end = self._offsets[index+1]
+                    stream_seek(self._stream, start, 0, self._path)
+                    detached_stream.add_chunk(start, stream_read(self._stream, end-start, self._path))
+
+                if index in self._values and not _is_stream_bound_value(self._values[index]):
+                    values[index] = self._values[index]
+
+            return LazyContainer(self._struct, detached_stream, dict(self._offsets), values, context, self._path, dict(self._dependencies))
+        finally:
+            stream_seek(self._stream, fallback, 0, self._path)
+
+    def _collect_dependencies(self, index, required, seen=None):
+        if seen is None:
+            seen = set()
+        if index in seen:
+            return
+        seen.add(index)
+        for dependency in self._dependencies.get(index, ()):
+            if not isinstance(dependency, int):
+                raise DetachError("field %r depends on an outer context entry and cannot be detached safely" % (self._struct.subcons[index].name or index,), path=self._path)
+            if dependency >= index:
+                raise DetachError("field %r depends on a field that is not available before it" % (self._struct.subcons[index].name or index,), path=self._path)
+            required.add(dependency)
+            self._collect_dependencies(dependency, required, seen)
+
+    def _detach_pointer(self, pointer, context, detached_stream, field_position):
+        if evaluate(pointer.stream, context) is not None:
+            raise DetachError("pointer uses a non-default stream and cannot be detached safely", path=self._path)
+        offset = evaluate(pointer.offset, context)
+        if pointer.relativeOffset:
+            target = field_position + offset
+        elif offset < 0:
+            target = stream_size(self._stream) + offset
+        else:
+            target = offset
+
+        stream_seek(self._stream, target, 0, self._path)
+        try:
+            size = pointer.subcon._actualsize(self._stream, context, self._path)
+        except SizeofError:
+            raise DetachError("pointer target cannot be measured safely", path=self._path)
+        stream_seek(self._stream, target, 0, self._path)
+        detached_stream.add_chunk(target, stream_read(self._stream, size, self._path))
+
+
+def _unwrap_renamed(sc):
+    while isinstance(sc, Renamed):
+        sc = sc.subcon
+    return sc
+
+
+def _iter_construct_parts(value, seen=None):
+    if seen is None:
+        seen = set()
+    if isinstance(value, Construct):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        yield value
+        value = value.__dict__
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_construct_parts(item, seen)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_construct_parts(item, seen)
+
+
+def _unsupported_detach_reason(sc):
+    for part in _iter_construct_parts(sc):
+        part = _unwrap_renamed(part)
+        if isinstance(part, (Pointer, Seek)):
+            return "%s moves outside its own byte range" % (type(part).__name__,)
+        if type(part).__module__ != Construct.__module__:
+            reason = _custom_construct_reason(part)
+            if reason:
+                return reason
+    return None
+
+
+def _custom_construct_reason(sc):
+    try:
+        source = inspect.getsource(type(sc))
+    except (OSError, TypeError):
+        return "custom construct cannot be inspected"
+    if ".seek(" in source or "stream_seek(" in source or "stream_read_entire(" in source or "stream_size(" in source:
+        return "custom construct may read outside its own byte range"
+    return None
+
+
+def _is_stream_bound_value(value):
+    if isinstance(value, (LazyContainer, LazyListContainer)):
+        return True
+    if callable(value):
+        return True
+    if isinstance(value, Container):
+        return any(_is_stream_bound_value(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_is_stream_bound_value(item) for item in value)
+    if isinstance(value, dict):
+        return any(_is_stream_bound_value(item) for item in value.values())
+    return False
+
+
+def _clone_lazy_context(context, stream):
+    chain = []
+    current = context
+    while isinstance(current, Container):
+        chain.append(current)
+        current = current.get("_")
+
+    root = None
+    cloned = None
+    clones = []
+    for original in reversed(chain):
+        cloned = Container()
+        for key, value in dict.items(original):
+            if key in ("_", "_io", "_root", "_params"):
+                continue
+            if not key.startswith("_"):
+                continue
+            cloned[key] = value
+        clones.append(cloned)
+
+    parent = None
+    for cloned in clones:
+        cloned["_"] = parent
+        cloned._io = stream
+        if parent is None:
+            root = cloned
+            cloned._root = cloned
+        else:
+            cloned._root = root
+        parent = cloned
+
+    cloned._params = root
+    return cloned
+
+
+class _LazyFieldMustParse(Exception):
+    pass
+
+
+def _field_dependencies(sc, struct, index):
+    names = set()
+    def visit(value, seen=None):
+        if seen is None:
+            seen = set()
+        if isinstance(value, BinExpr):
+            visit(value.lhs, seen)
+            visit(value.rhs, seen)
+            return
+        if isinstance(value, UniExpr):
+            visit(value.operand, seen)
+            return
+        if isinstance(value, FuncPath):
+            visit(getattr(value, "_FuncPath__operand", None), seen)
+            return
+        if isinstance(value, Path):
+            chain = []
+            current = value
+            while isinstance(current, Path):
+                field = current.__getfield__()
+                if field is not None:
+                    chain.append(field)
+                current = getattr(current, "_Path__parent", None)
+            chain = [field for field in reversed(chain) if field is not None]
+            if chain:
+                if chain[0] == "_":
+                    names.add(".".join(chain))
+                elif chain[0] in struct._subconsindexes:
+                    names.add(chain[0])
+            return
+        if isinstance(value, Construct):
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            visit(value.__dict__, seen)
+            return
+        if callable(value) and not isinstance(value, (Path, BinExpr, UniExpr, FuncPath, Construct)):
+            try:
+                source = inspect.getsource(value)
+                tree = ast.parse(source.strip())
+            except (OSError, SyntaxError, TypeError):
+                return
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and node.attr in struct._subconsindexes:
+                    names.add(node.attr)
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in struct._subconsindexes:
+                    names.add(node.value)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                visit(item, seen)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                visit(item, seen)
+
+    visit(sc)
+    dependencies = []
+    for name in names:
+        if isinstance(name, str) and name in struct._subconsindexes:
+            dependency = struct._subconsindexes[name]
+        else:
+            dependency = name
+        if dependency != index and dependency not in dependencies:
+            dependencies.append(dependency)
+    return dependencies
+
+
+def _measure_lazy_field(sc, stream, context, struct, index, values, offsets, dependencies, path):
+    try:
+        return sc._actualsize(stream, context, path)
+    except (SizeofError, KeyError, AttributeError):
+        needed = [
+            dependency for dependency in dependencies.get(index, ())
+            if isinstance(dependency, int)
+            and dependency < index
+            and struct.subcons[dependency].name
+            and struct.subcons[dependency].name not in context
+        ]
+        if not needed:
+            raise _LazyFieldMustParse()
+
+        field_offset = stream_tell(stream, path)
+        for dependency in needed:
+            dependency_sc = struct.subcons[dependency]
+            stream_seek(stream, offsets[dependency], 0, path)
+            value = dependency_sc._parsereport(stream, context, path)
+            values[dependency] = value
+            if dependency_sc.name:
+                context[dependency_sc.name] = value
+        stream_seek(stream, field_offset, 0, path)
+        try:
+            return sc._actualsize(stream, context, path)
+        except (SizeofError, KeyError, AttributeError):
+            raise _LazyFieldMustParse()
+
 
 class LazyStruct(Construct):
     r"""
@@ -6001,7 +6413,7 @@ class LazyStruct(Construct):
 
     Note there are restrictions:
 
-    * If a field like Bytes(this.field) references another field in the same struct, you need to access the referenced field first (to trigger its parsing) and then you can access the Bytes field. Otherwise it would fail due to missing context entry.
+    * A field like Bytes(this.field) automatically parses referenced fields from the same struct when needed.
     * If a field references another field within inner (nested) or outer (super) struct, things may break. Context is nested, but this class was not rigorously tested in that manner.
 
     Building and sizeof are greedy, like in Struct.
@@ -6028,18 +6440,38 @@ class LazyStruct(Construct):
         offset = stream_tell(stream, path)
         offsets = {0: offset}
         values = {}
+        dependencies = {}
         for i,sc in enumerate(self.subcons):
+            dependencies[i] = _field_dependencies(sc, self, i)
+            for dependency in dependencies[i]:
+                if isinstance(dependency, int) and dependency < i and dependency not in values and self.subcons[dependency].name and self.subcons[dependency].name not in context:
+                    dependency_sc = self.subcons[dependency]
+                    stream_seek(stream, offsets[dependency], 0, path)
+                    value = dependency_sc._parsereport(stream, context, path)
+                    values[dependency] = value
+                    context[dependency_sc.name] = value
+                    stream_seek(stream, offset, 0, path)
             try:
-                offset += sc._actualsize(stream, context, path)
+                size = _measure_lazy_field(sc, stream, context, self, i, values, offsets, dependencies, path)
+                offset += size
                 stream_seek(stream, offset, 0, path)
-            except SizeofError:
-                parseret = sc._parsereport(stream, context, path)
-                values[i] = parseret
-                if sc.name:
-                    context[sc.name] = parseret
+            except _LazyFieldMustParse:
+                if i == len(self.subcons)-1 and _unwrap_renamed(sc) is GreedyBytes:
+                    end = stream_size(stream)
+                    stream_seek(stream, end, 0, path)
+                    offset = end
+                else:
+                    stream_seek(stream, offset, 0, path)
+                    parseret = sc._parsereport(stream, context, path)
+                    values[i] = parseret
+                    if sc.name:
+                        context[sc.name] = parseret
                 offset = stream_tell(stream, path)
-            offsets[i+1] = offset
-        return LazyContainer(self, stream, offsets, values, context, path)
+            if i == len(self.subcons)-1 and _unwrap_renamed(sc) is GreedyBytes:
+                offsets[i+1] = None
+            else:
+                offsets[i+1] = offset
+        return LazyContainer(self, stream, offsets, values, context, path, dependencies)
 
     def _build(self, obj, stream, context, path):
         # exact copy from Struct class

@@ -39,10 +39,22 @@ Fields are parsed depending on some factors:
 
 Note there are restrictions:
 
-* If a field like ``Bytes(this.field)`` references another field in the same struct, you need to access the referenced field first (to trigger its parsing) and then you can access the ``Bytes`` field. Otherwise it would fail due to missing context entry.
+* A field like ``Bytes(this.field)`` automatically parses referenced fields from the same struct when needed.
 * If a field references another field within inner (nested) or outer (super) struct, things may break. Context is nested, but this class was not rigorously tested in that manner.
 
 Building and sizeof are greedy, like in ``Struct``.
+
+A parsed :class:`LazyContainer` can detach selected fields before the original stream is closed:
+
+>>> d = LazyStruct(
+...     "length" / Byte,
+...     "data" / Bytes(this.length),
+...     "unused" / GreedyBytes,
+... )
+>>> obj = d.parse(b"\x03abc" + b"X" * 100)
+>>> detached = obj.detach("data")
+
+Only the selected fields and their necessary dependencies are copied. Fields whose dependencies cannot be resolved, or custom fields that may seek outside their own byte range, raise ``DetachError``.
 
 
 LazyArray

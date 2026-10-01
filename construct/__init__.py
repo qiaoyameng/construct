@@ -73,6 +73,7 @@ __all__ = [
     'CString',
     'Debugger',
     'Default',
+    'DetachError',
     'Double',
     'EncryptedSym',
     'EncryptedSymAead',

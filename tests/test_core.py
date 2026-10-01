@@ -1533,6 +1533,82 @@ def test_lazystruct():
     assert d.build(Container(obj)) == b"\x00\x00\x01\x00\x02\x00\x01\x00"
     assert raises(d.sizeof) == SizeofError
 
+def test_lazystruct_detach():
+    class RecordingStream(io.BytesIO):
+        def __init__(self, data):
+            super().__init__(data)
+            self.reads = []
+
+        def read(self, size=-1):
+            position = self.tell()
+            data = super().read(size)
+            if data:
+                self.reads.append((position, position + len(data)))
+            return data
+
+    inner = LazyStruct(
+        "inner_length" / Byte,
+        "inner_data" / Bytes(this.inner_length),
+    )
+    d = LazyStruct(
+        "outer_length" / Byte,
+        "nested" / FixedSized(this.outer_length, inner),
+        "ignored" / GreedyBytes,
+    )
+
+    data = b"\x04\x03abc" + b"X" * 100
+    stream = RecordingStream(data)
+    obj = d.parse_stream(stream)
+    assert stream.reads == [(0, 1)]
+
+    stream.seek(99)
+    stream.reads.clear()
+    detached = obj.detach("nested")
+    assert stream.tell() == 99
+    assert stream.reads == [(0, 1), (1, 5)]
+    stream.close()
+
+    assert detached.nested.inner_data == b"abc"
+    assert detached.nested.inner_length == 3
+
+    stream = RecordingStream(b"\x02\x03abcde")
+    flat = LazyStruct(
+        "a" / Byte,
+        "length" / Byte,
+        "data" / Bytes(this.length),
+        "tail" / Byte,
+    ).parse_stream(stream)
+    stream.seek(4)
+    detached_flat = flat.detach(["a", "data"])
+    assert sorted(set(stream.reads)) == [(0, 1), (1, 2), (2, 5)]
+    assert all(end <= 5 for start, end in stream.reads)
+    assert stream.tell() == 4
+    detached_position = detached_flat._stream.tell()
+    assert detached_flat.data == b"abc"
+    assert detached_flat._stream.tell() == detached_position
+    assert flat._stream.tell() == 4
+
+def test_lazystruct_detach_pointer_and_unsafe_construct():
+    d = LazyStruct(
+        "offset" / Byte,
+        "pointed" / Pointer(this.offset, Byte),
+        "ignored" / GreedyBytes,
+    )
+    stream = io.BytesIO(b"\x03XXXX\xff")
+    obj = d.parse_stream(stream)
+    detached = obj.detach("pointed")
+    stream.close()
+    assert detached.pointed == ord("X")
+
+    class OutsideRange(Adapter):
+        def _decode(self, obj, context, path):
+            context._io.seek(0)
+            return context._io.read(1)
+
+    unsafe = LazyStruct("field" / OutsideRange(Byte))
+    parsed = unsafe.parse(b"\x01")
+    assert raises(parsed.detach, "field") == DetachError
+
 def test_lazyarray():
     d = LazyArray(5, Int8ub)
     obj = d.parse(b"\x00\x01\x02\x03\x04")
