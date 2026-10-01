@@ -26,6 +26,17 @@ ListContainer([513, 258])
 >>> d.sizeof()
 0
 
+``Prefixed`` normally reads the entire declared segment into memory and parses the subcon over a new ``BytesIO``. Pass ``streaming=True`` to instead parse over a bounded window of the parent stream. The subcon sees its own origin (position 0) and EOF (the declared length); no read or seek crosses either boundary. This keeps memory bounded by the subcon's individual read sizes instead of the segment length.
+
+>>> d = Struct(
+...     "body" / Prefixed(Int32ub, GreedyRange(Int32ul), streaming=True),
+...     "tail" / Byte,
+... )
+
+On a seekable stream, parsing always leaves the stream exactly at the end of the segment: when the subcon stops early, raises, or is referenced lazily (``Lazy``), the position is pinned to ``lenfield_start + length``. A following field is therefore always aligned.
+
+On a non-seekable stream only forward parsing is supported: the window consumes remaining bytes by reading and discarding them, so the next field still starts aligned; backwards seeks (as used by ``Peek`` or ``Lazy`` evaluation) raise ``StreamError``.
+
 ``OffsettedEnd`` parses a greedy subcon until EOF plus a negative offset. This way you can read (almost) all data but leave some bytes left for a fixed sized footer.
 
 >>> d = Struct(
@@ -74,4 +85,3 @@ None
 >>> Terminated.parse(b"remaining")
 TerminatedError: Error in path (parsing)
 expected end of stream
-

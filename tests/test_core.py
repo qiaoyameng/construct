@@ -1124,6 +1124,115 @@ def test_prefixed():
     d = Prefixed(Byte, GreedyString("utf-8"))
     common(d, b"\x0a"+bytes(10), u"\x00"*10, SizeofError)
 
+class _TrackingStream(io.RawIOBase):
+    def __init__(self, data):
+        self._bio = io.BytesIO(data)
+        self.maxread = 0
+        self.readsizes = []
+    def readable(self):
+        return True
+    def seekable(self):
+        return True
+    def read(self, count=-1):
+        data = self._bio.read(count)
+        self.readsizes.append(len(data))
+        self.maxread = max(self.maxread, len(data))
+        return data
+    def seek(self, offset, whence=0):
+        return self._bio.seek(offset, whence)
+    def tell(self):
+        return self._bio.tell()
+
+class _ForwardOnlyStream:
+    def __init__(self, data):
+        self._bio = io.BytesIO(data)
+    def read(self, count=-1):
+        return self._bio.read(count)
+    def seekable(self):
+        return False
+    def tell(self):
+        return self._bio.tell()
+
+class _FailingConstruct(Construct):
+    def _parse(self, stream, context, path):
+        raise ValueError("deliberate failure")
+
+def test_prefixed_streaming():
+    size = 100_000
+    payload = bytes(range(4)) * size
+    data = (size * 4).to_bytes(4, "big") + payload + b"\xaa"
+
+    d = Struct(
+        "body" / Prefixed(Int32ub, GreedyRange(Int32ub), streaming=True),
+        "tail" / Byte,
+    )
+
+    stream = _TrackingStream(data)
+    result = d.parse_stream(stream)
+    assert len(result.body) == size
+    assert result.tail == 0xaa
+    assert stream.tell() == len(data)
+    assert max(stream.readsizes) == 4
+
+    classic = _TrackingStream(data)
+    Prefixed(Int32ub, GreedyRange(Int32ub)).parse_stream(classic)
+    assert classic.maxread == size * 4
+
+    assert Prefixed(VarInt, GreedyBytes, streaming=True).parse(b"\x03abcZZ") == b"abc"
+    d = Prefixed(Byte, Sequence(Peek(Byte), Int16ub, GreedyBytes), streaming=True)
+    assert d.parse(b"\x02\x00\xffZZZZ") == [0, 255, b""]
+
+    d = Struct("x" / Prefixed(Byte, Byte, streaming=True), "t" / Byte)
+    assert d.parse(b"\x05ZZZZZ\x77") == Container(x=90, t=119)
+
+    stream = io.BytesIO(b"\x05ZZZZZ\x77")
+    assert raises(lambda: Struct("x" / Prefixed(Byte, _FailingConstruct(), streaming=True), "t" / Byte).parse_stream(stream)) == ValueError
+    assert stream.tell() == 6
+
+    assert raises(Prefixed(Byte, GreedyBytes, streaming=True).parse, b"\x05ab") == StreamError
+    assert raises(Prefixed(Byte, Bytes(5), streaming=True).parse, b"\x03abcdef") == StreamError
+
+    d = Struct(
+        "inner" / Prefixed(Byte, Struct("a" / Byte, "b" / Lazy(Byte), "rest" / GreedyBytes), streaming=True),
+        "tail" / Byte,
+    )
+    result = d.parse(b"\x06\x01\x02\x03\x04\x05\x06\x99")
+    assert result.inner.a == 1
+    assert result.inner.b() == 2
+    assert result.inner.rest == b"\x03\x04\x05\x06"
+    assert result.tail == 0x99
+
+    d = Struct("body" / Prefixed(Int8ub, GreedyRange(Int8ub), streaming=True), "tail" / Byte)
+    stream = _ForwardOnlyStream(b"\x03abc\x99")
+    result = d.parse_stream(stream)
+    assert result == Container(body=[97, 98, 99], tail=153)
+    assert stream.tell() == 5
+
+    stream = _ForwardOnlyStream(b"\x05ZZZZZ\x77")
+    result = Struct("x" / Prefixed(Byte, Byte, streaming=True), "t" / Byte).parse_stream(stream)
+    assert result == Container(x=90, t=119)
+    assert stream.tell() == 7
+
+    stream = _ForwardOnlyStream(b"\x03abc")
+    assert raises(Prefixed(Byte, Sequence(Peek(Byte), GreedyBytes), streaming=True).parse_stream, stream) == StreamError
+
+    stream = _ForwardOnlyStream(b"\x03\x01\x02\x03\x99")
+    d = Struct("inner" / Prefixed(Byte, Struct("b" / Lazy(Byte), "r" / GreedyBytes), streaming=True), "tail" / Byte)
+    result = d.parse_stream(stream)
+    assert stream.tell() == 5
+    assert raises(result.inner.b) == StreamError
+
+    d = Prefixed(Byte, GreedyRange(Byte), includelength=True, streaming=True)
+    assert d.parse(b"\x04abcZ") == [97, 98, 99]
+
+    d = Struct(
+        "a" / Prefixed(Byte, Prefixed(Byte, GreedyBytes, streaming=True), streaming=True),
+        "tail" / Byte,
+    )
+    assert d.parse(b"\x04\x03abc\x99") == Container(a=b"abc", tail=153)
+
+    assert Prefixed(Byte, GreedyBytes, streaming=True).build(b"abc") == b"\x03abc"
+
 def test_prefixedarray():
     common(PrefixedArray(Byte,Byte), b"\x02\x0a\x0b", [10,11], SizeofError)
     assert PrefixedArray(Byte, Byte).parse(b"\x03\x01\x02\x03") == [1,2,3]
