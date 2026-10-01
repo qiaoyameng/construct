@@ -7,3 +7,5 @@ Core API: Integers and Floats
 .. autofunction:: construct.BitsInteger
 .. autofunction:: construct.VarInt
 .. autofunction:: construct.ZigZag
+.. autoclass:: construct.FixedPoint
+    :members:

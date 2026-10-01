@@ -71,6 +71,41 @@ Or another example, where some of the bits are unset in both parsed/built object
     b'\x0f'
 
 
+Exact fixed-point values
+------------------------------------
+
+Telemetry fields commonly store a signed raw integer while the physical
+value is ``raw * scale + offset``. Use :class:`FixedPoint` for these fields:
+parsing returns a ``Decimal`` and the conversion is calculated with exact
+rational integer arithmetic, never through Python ``float``.
+
+Building always requires a rounding mode from the ``decimal`` module and an
+overflow policy. Values without a finite decimal representation, ``NaN``, and
+``Infinity`` are rejected rather than silently truncated.
+
+::
+
+    d = FixedPoint(
+        Int16sb,
+        scale="0.1",
+        offset="0.25",
+        rounding=ROUND_HALF_EVEN,
+        overflow=FIXED_POINT_OVERFLOW_RAISE,
+    )
+
+For the two independent boundary samples above:
+``80 00`` is raw ``-32768`` and decodes to
+``-32768 * 0.1 + 0.25 = -3276.55``; ``80 01`` is raw ``-32767`` and
+decodes to ``-3276.45``. At the adjacent negative half-quantum point, raw
+``-32767.5`` represents ``-3276.50``; because ``-32767`` is odd, both
+``ROUND_HALF_EVEN`` and ``ROUND_HALF_UP`` select ``-32768``.
+
+Scale, offset, and width can also be context lambdas. Non-byte-aligned
+widths are used normally inside ``BitStruct`` or ``Bitwise`` with explicit
+padding. ``sizeof()`` only measures the signed integer subcon and performs
+neither rounding nor fixed-point conversion.
+
+
 Validating and filtering
 ==============================
 
@@ -119,4 +154,3 @@ For example, if 7 out of 8 bits are not allowed to be set (like a flag boolean):
     >>> d.build(88)
     ValidationError: Error in path (building)
     object failed validation: 88
-

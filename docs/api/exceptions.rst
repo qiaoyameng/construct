@@ -9,6 +9,7 @@ Core API: Exception types
 .. autofunction:: construct.StreamError
 .. autofunction:: construct.FormatFieldError
 .. autofunction:: construct.IntegerError
+.. autofunction:: construct.FixedPointError
 .. autofunction:: construct.StringError
 .. autofunction:: construct.MappingError
 .. autofunction:: construct.RangeError

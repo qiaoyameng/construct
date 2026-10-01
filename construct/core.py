@@ -1,6 +1,19 @@
 # -*- coding: utf-8 -*-
 
 import struct, io, binascii, itertools, collections, pickle, sys, os, hashlib, importlib, importlib.machinery, importlib.util
+from decimal import (
+    Decimal,
+    InvalidOperation,
+    ROUND_05UP,
+    ROUND_CEILING,
+    ROUND_DOWN,
+    ROUND_FLOOR,
+    ROUND_HALF_DOWN,
+    ROUND_HALF_EVEN,
+    ROUND_HALF_UP,
+    ROUND_UP,
+)
+from fractions import Fraction
 
 from construct.lib import *
 from construct.expr import *
@@ -51,6 +64,12 @@ class IntegerError(ConstructError):
     Only some numeric parsing classes can raise this exception: BytesInteger BitsInteger VarInt ZigZag. It can mean either the length parameter is invalid, the value is not an integer, the value is negative or too low or too high for given parameters, or the selected endianness cannot be applied.
     """
     pass
+class FixedPointError(ConstructError):
+    """
+    FixedPoint can raise this exception when a scale, offset, width, rounding mode, or value cannot be used for an exact fixed-point conversion.
+    """
+    pass
+
 class StringError(ConstructError):
     """
     Almost all parsing classes can raise this exception: It can mean a unicode string was passed instead of bytes, or a bytes was passed instead of a unicode string. Also some classes can raise it explicitly: PascalString CString GreedyString. It can mean no encoding or invalid encoding was selected. Note that currently, if the data cannot be encoded decoded given selected encoding then UnicodeEncodeError UnicodeDecodeError are raised, which are not rooted at ConstructError.
@@ -6275,6 +6294,282 @@ class ExprAdapter(Adapter):
         super().__init__(subcon)
         self._decode = lambda obj,ctx,path: decoder(obj,ctx)
         self._encode = lambda obj,ctx,path: encoder(obj,ctx)
+
+
+FIXED_POINT_OVERFLOW_RAISE = "raise"
+FIXED_POINT_OVERFLOW_CLAMP = "clamp"
+FIXED_POINT_OVERFLOW_WRAP = "wrap"
+_FIXED_POINT_ROUNDING_MODES = frozenset((
+    ROUND_CEILING,
+    ROUND_DOWN,
+    ROUND_FLOOR,
+    ROUND_HALF_DOWN,
+    ROUND_HALF_EVEN,
+    ROUND_HALF_UP,
+    ROUND_UP,
+    ROUND_05UP,
+))
+_FIXED_POINT_OVERFLOW_POLICIES = frozenset((
+    FIXED_POINT_OVERFLOW_RAISE,
+    FIXED_POINT_OVERFLOW_CLAMP,
+    FIXED_POINT_OVERFLOW_WRAP,
+))
+
+
+def _decimal_to_rational(value):
+    if isinstance(value, bool) or not isinstance(value, (int, str, Decimal, Fraction)):
+        raise FixedPointError("value must be an int, str, Decimal, or Fraction, not %r" % (value,))
+    if isinstance(value, int):
+        return value, 1
+    if isinstance(value, Fraction):
+        denominator = value.denominator
+        while denominator % 2 == 0:
+            denominator //= 2
+        while denominator % 5 == 0:
+            denominator //= 5
+        if denominator != 1:
+            raise FixedPointError("value has no finite decimal representation with exact precision")
+        return value.numerator, value.denominator
+    try:
+        decimal_value = value if isinstance(value, Decimal) else Decimal(value)
+    except InvalidOperation:
+        raise FixedPointError("value is not a finite decimal: %r" % (value,))
+    if not decimal_value.is_finite():
+        raise FixedPointError("NaN and Infinity are not representable as fixed-point values")
+    sign, digits, exponent = decimal_value.as_tuple()
+    numerator = int("".join(str(digit) for digit in digits) or "0")
+    if sign:
+        numerator = -numerator
+    if exponent >= 0:
+        return numerator * 10**exponent, 1
+    return numerator, 10**(-exponent)
+
+
+def _rational_to_decimal(numerator, denominator):
+    fraction = Fraction(numerator, denominator)
+    reduced_denominator = fraction.denominator
+    twos = 0
+    while reduced_denominator % 2 == 0:
+        twos += 1
+        reduced_denominator //= 2
+    fives = 0
+    while reduced_denominator % 5 == 0:
+        fives += 1
+        reduced_denominator //= 5
+    if reduced_denominator != 1:
+        raise FixedPointError("value has no finite decimal representation with exact precision")
+    places = max(twos, fives)
+    scaled_numerator = fraction.numerator
+    if twos > fives:
+        scaled_numerator *= 5 ** (twos - fives)
+    elif fives > twos:
+        scaled_numerator *= 2 ** (fives - twos)
+    return Decimal(scaled_numerator).scaleb(-places)
+
+
+def _round_fraction(numerator, denominator, rounding):
+    if denominator < 0:
+        numerator = -numerator
+        denominator = -denominator
+    absolute_quotient, remainder = divmod(abs(numerator), denominator)
+    quotient = absolute_quotient if numerator >= 0 else -absolute_quotient
+    if remainder == 0:
+        return quotient
+    negative = numerator < 0
+    half = remainder * 2
+    if rounding == ROUND_UP:
+        increment = True
+    elif rounding == ROUND_DOWN:
+        increment = False
+    elif rounding == ROUND_CEILING:
+        increment = not negative
+    elif rounding == ROUND_FLOOR:
+        increment = negative
+    elif rounding == ROUND_HALF_UP:
+        increment = half >= denominator
+    elif rounding == ROUND_HALF_DOWN:
+        increment = half > denominator
+    elif rounding == ROUND_HALF_EVEN:
+        increment = half > denominator or (half == denominator and quotient % 2 != 0)
+    elif rounding == ROUND_05UP:
+        truncated_toward_zero = quotient
+        last_digit = abs(truncated_toward_zero) % 10
+        increment = last_digit in (0, 5)
+    else:
+        raise FixedPointError("unsupported rounding mode %r" % (rounding,))
+    if not increment:
+        return quotient
+    return quotient + (-1 if negative else 1)
+
+
+class FixedPoint(Adapter):
+    r"""
+    Exact signed fixed-point adapter using Decimal rather than float.
+
+    A stored signed integer represents ``raw * scale + offset``. Scale and
+    offset may be ints, strings, Decimals, Fractions, or context lambdas that
+    return one of those types. Width may be supplied explicitly or through a
+    signed :class:`BitsInteger`, :class:`BytesInteger`, or integer
+    :class:`FormatField` subcon.
+
+    Building requires an explicit rounding mode and overflow policy. Rounding
+    modes are the constants from Python's decimal module. Overflow policies
+    are FIXED_POINT_OVERFLOW_RAISE, FIXED_POINT_OVERFLOW_CLAMP, and
+    FIXED_POINT_OVERFLOW_WRAP.
+
+    :param subcon: signed integer field, optional when width is provided
+    :param scale: exact scale, or a context lambda returning one
+    :param offset: exact offset, or a context lambda returning one
+    :param width: signed integer width in bits, or a context lambda
+    :param rounding: required decimal module ROUND_* constant used for building
+    :param overflow: required FIXED_POINT_OVERFLOW_* policy
+    :param swapped: little-endian byte order when an integer subcon is created
+
+    :raises FixedPointError: conversion parameters or value are invalid
+    :raises SizeofError: subcon size cannot be measured from context
+
+    Example::
+
+        >>> d = FixedPoint(Int16sb, scale="0.1", offset="0.25",
+        ...     rounding=ROUND_HALF_EVEN, overflow=FIXED_POINT_OVERFLOW_RAISE)
+        >>> d.parse(b"\x80\x00")
+        Decimal('-3276.55')
+    """
+
+    def __init__(self, subcon=None, scale=1, offset=0, width=None, *,
+                 rounding, overflow, swapped=False):
+        if rounding not in _FIXED_POINT_ROUNDING_MODES:
+            raise FixedPointError("rounding must be a decimal module ROUND_* constant")
+        if overflow not in _FIXED_POINT_OVERFLOW_POLICIES:
+            raise FixedPointError("overflow must be one of the FIXED_POINT_OVERFLOW_* constants")
+        if subcon is None:
+            if width is None:
+                raise FixedPointError("either a signed integer subcon or width is required")
+            if callable(width):
+                Construct.__init__(self)
+                self.subcon = None
+            else:
+                subcon = self._make_integer(width, swapped)
+                super().__init__(subcon)
+        elif not isinstance(subcon, Construct):
+            raise FixedPointError("subcon must be a Construct instance")
+        else:
+            super().__init__(subcon)
+        self.scale = scale
+        self.offset = offset
+        self.width = self._infer_width() if width is None else width
+        self.rounding = rounding
+        self.overflow = overflow
+        self.swapped = swapped
+        if not callable(self.width):
+            self._validate_width(self.width)
+
+    @staticmethod
+    def _make_integer(width, swapped):
+        if callable(width):
+            raise FixedPointError("context-dependent width requires a matching integer subcon")
+        width_value = FixedPoint._valid_width(width)
+        if width_value % 8 == 0:
+            return BytesInteger(width_value // 8, signed=True, swapped=swapped)
+        return BitsInteger(width_value, signed=True, swapped=swapped)
+
+    @staticmethod
+    def _valid_width(width):
+        if not isinstance(width, int) or isinstance(width, bool) or width <= 0:
+            raise FixedPointError("width must be a positive integer or context lambda")
+        return width
+
+    def _validate_width(self, width):
+        width = self._valid_width(width)
+        inferred_width = self._infer_width()
+        if inferred_width is not None and inferred_width != width:
+            raise FixedPointError("width %s does not match signed integer subcon width %s" % (width, inferred_width))
+
+    def _infer_width(self):
+        subcon = self.subcon
+        if isinstance(subcon, BitsInteger):
+            if not subcon.signed:
+                raise FixedPointError("FixedPoint requires a signed integer subcon")
+            return subcon.length
+        if isinstance(subcon, BytesInteger):
+            if not subcon.signed:
+                raise FixedPointError("FixedPoint requires a signed integer subcon")
+            length = subcon.length
+            return (lambda context: evaluate(length, context) * 8) if callable(length) else length * 8
+        if isinstance(subcon, FormatField) and subcon.fmtstr[-1] in "bhlq":
+            return subcon.length * 8
+        return None
+
+    def _configuration(self, context):
+        scale_num, scale_den = _decimal_to_rational(evaluate(self.scale, context))
+        if scale_num == 0:
+            raise FixedPointError("scale must not be zero")
+        offset_num, offset_den = _decimal_to_rational(evaluate(self.offset, context))
+        inferred_width = self._infer_width()
+        if callable(inferred_width):
+            inferred_width = evaluate(inferred_width, context)
+        width = evaluate(self.width, context)
+        if inferred_width is None:
+            width = self._valid_width(width)
+        else:
+            width = self._valid_width(width)
+            if inferred_width != width:
+                raise FixedPointError("width %s does not match signed integer subcon width %s" % (width, inferred_width))
+        return scale_num, scale_den, offset_num, offset_den, width
+
+    def _integer_subcon(self, context):
+        width = self._valid_width(evaluate(self.width, context))
+        if width % 8 == 0:
+            return BytesInteger(width // 8, signed=True, swapped=self.swapped)
+        return BitsInteger(width, signed=True, swapped=self.swapped)
+
+    def _parse(self, stream, context, path):
+        if self.subcon is None:
+            raw = self._integer_subcon(context)._parsereport(stream, context, path)
+            return self._decode(raw, context, path)
+        return super()._parse(stream, context, path)
+
+    def _build(self, obj, stream, context, path):
+        if self.subcon is None:
+            raw = self._encode(obj, context, path)
+            self._integer_subcon(context)._build(raw, stream, context, path)
+            return obj
+        return super()._build(obj, stream, context, path)
+
+    def _sizeof(self, context, path):
+        if self.subcon is None:
+            width = self._valid_width(evaluate(self.width, context))
+            return width if width % 8 else width // 8
+        return super()._sizeof(context, path)
+
+    def _decode(self, obj, context, path):
+        if isinstance(obj, bool) or not isinstance(obj, int):
+            raise FixedPointError("raw value must be an integer, not %r" % (obj,), path=path)
+        scale_num, scale_den, offset_num, offset_den, width = self._configuration(context)
+        lower = -(1 << (width - 1))
+        upper = (1 << (width - 1)) - 1
+        if not lower <= obj <= upper:
+            raise FixedPointError("raw value %s is outside signed %d-bit range" % (obj, width), path=path)
+        numerator = obj * scale_num * offset_den + offset_num * scale_den
+        denominator = scale_den * offset_den
+        return _rational_to_decimal(numerator, denominator)
+
+    def _encode(self, obj, context, path):
+        scale_num, scale_den, offset_num, offset_den, width = self._configuration(context)
+        value_num, value_den = _decimal_to_rational(obj)
+        numerator = (value_num * scale_den * offset_den - offset_num * value_den * scale_den)
+        denominator = value_den * scale_num * offset_den
+        raw = _round_fraction(numerator, denominator, self.rounding)
+        lower = -(1 << (width - 1))
+        upper = (1 << (width - 1)) - 1
+        if lower <= raw <= upper:
+            return raw
+        if self.overflow == FIXED_POINT_OVERFLOW_RAISE:
+            raise FixedPointError("rounded raw value %s overflows signed %d-bit range" % (raw, width), path=path)
+        if self.overflow == FIXED_POINT_OVERFLOW_CLAMP:
+            return min(max(raw, lower), upper)
+        modulus = 1 << width
+        return (raw - lower) % modulus + lower
 
 
 class ExprSymmetricAdapter(ExprAdapter):
