@@ -47,11 +47,55 @@ Container(a=True, b=7, c=887, d=None)
 Important notes
 ===============
 
-* ``BitStruct``'s are non-nestable (because ``Bitwise`` are not nestable) so writing something like ``BitStruct(BitStruct(Octet))`` will not work. You can use regular ``Struct`` inside ``BitStruct`` .
-* Byte aligned - The total size of the elements of a ``BitStruct`` must be a multiple of 8 (due to alignment issues). ``RestreamedBytesIO`` will raise an error if the amount of bits and bytes does not align properly.
+* ``BitStruct``\ s are not nested directly because ``Bitwise`` changes the stream granularity. Write ``BitStruct(...)`` for a byte-aligned outer boundary and use a regular ``Struct`` to group fields inside it.
+* Byte aligned - The total size consumed by an outer ``Bitwise`` or ``BitStruct`` must be a multiple of 8 because the result is stored in an underlying byte stream. Individual fields may be unaligned and may cross a byte boundary. A fixed-sized unaligned ``Bitwise`` raises ``SizeofError`` and also fails parsing and building instead of silently truncating bits.
 * ``GreedyRange``, ``Pointer`` and any ``Lazy*`` - Do not place fields that do seeking/telling or lazy parsing inside ``Bitwise``, because ``RestreamedBytesIO`` offsets will turn out wrong, have unknown side-effects or raise unknown exceptions.
 * Normal (byte-oriented) classes like ``Int*`` or ``Float*`` can be used by wrapping in ``Bytewise``. If you need to mix byte- and bit-oriented fields, you should use a ``BitStruct`` and ``Bytewise`` .
 * Advanced classes like tunneling may not work in bitwise context. Only basic fields like integers were throughly tested.
+
+
+Integer bit order
+=================
+
+``BitsInteger`` normally reads an integer MSB-first. The two ordering
+parameters are independent:
+
+* ``swapped=True`` swaps eight-bit byte groups. It therefore only applies to field widths that are a multiple of 8 and represents little-endian byte order.
+* ``reversed=True`` reverses the complete bit-string belonging to that integer. It is valid for arbitrary widths, including 3, 11 or 2 bits, and represents an LSB-first integer.
+
+The reversal is limited to the declared integer; adjacent bit fields are not
+reordered. In this 16-bit example the 11-bit LSB-first field crosses the
+underlying byte boundary, while the 3- and 2-bit neighbors remain unchanged::
+
+    >>> d = BitStruct(
+    ...     "a" / BitsInteger(3),
+    ...     "b" / BitsInteger(11, reversed=True),
+    ...     "c" / BitsInteger(2),
+    ... )
+    >>> d.parse(bytes([0b10110010, 0b01001111]))
+    Container(a=5, b=1609, c=3)
+
+Negative values use two's complement within the declared bit width. A signed
+11-bit field accepts values from -1024 through 1023 and rejects values outside
+that range.
+
+``BitsSwapped`` is different: it reverses bits inside every byte of the stream
+surrounding a construct, rather than reversing one logical integer. Do not use
+``swapped=True`` as an alias for an arbitrary-width LSB-first field.
+
+
+Nesting ``Bitwise`` and ``Bytewise``
+===================================
+
+A byte stream enters ``Bitwise`` and becomes an MSB-first bit stream. Use
+``Bytewise`` only inside that context to give a byte-oriented subconstruct a
+byte stream again. Its subconstruct must consume or produce whole bytes; those
+bytes may begin at an unaligned bit position within the enclosing bit stream.
+
+Do not use ``Bytewise`` outside ``Bitwise``, and do not nest a second
+``Bitwise`` directly inside an existing bit stream. Pairing the wrappers
+(``Bitwise(Bytewise(...))``) merely returns to the current granularity; use the
+inner construct directly unless that explicit boundary is required.
 
 
 Fields that work with bits

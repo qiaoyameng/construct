@@ -36,6 +36,14 @@ def test_bitwise():
     common(Bitwise(Array(8,Bit)), b"\xff", [1,1,1,1,1,1,1,1], 1)
     common(Bitwise(Array(2,Nibble)), b"\xff", [15,15], 1)
     common(Bitwise(Array(1,Octet)), b"\xff", [255], 1)
+    d = Bitwise(BitsInteger(11))
+    assert raises(d.sizeof) == SizeofError
+    assert raises(d.parse, b"\x00\x00") == StreamError
+    assert raises(d.build, 0) == StreamError
+    compiled = d.compile()
+    assert raises(compiled.sizeof) == SizeofError
+    assert raises(compiled.parse, b"\x00\x00") == StreamError
+    assert raises(compiled.build, 0) == StreamError
 
     common(Bitwise(GreedyBytes), bytes(10), bytes(80), SizeofError)
 
@@ -43,6 +51,7 @@ def test_bytewise():
     common(Bitwise(Bytewise(Bytes(1))), b"\xff", b"\xff", 1)
     common(BitStruct("p1"/Nibble, "num"/Bytewise(Int24ub), "p2"/Nibble), b"\xf0\x10\x20\x3f", Container(p1=15, num=0x010203, p2=15), 4)
     common(Bitwise(Sequence(Nibble, Bytewise(Int24ub), Nibble)), b"\xf0\x10\x20\x3f", [0x0f,0x010203,0x0f], 4)
+    common(BitStruct("p1"/Nibble, "num"/Bytewise(Int8ub), "p2"/Nibble), b"\xab\xcd", Container(p1=10, num=0xbc, p2=13), 2)
     common(Bitwise(Bytewise(GreedyBytes)), bytes(10), bytes(10), SizeofError)
 
 def test_ints():
@@ -171,10 +180,42 @@ def test_bitsinteger():
     d = BitsInteger(16, swapped=this.swapped)
     common(d, b"\x01\x01\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00", 0xff00, 16, swapped=False)
     common(d, b"\x00\x00\x00\x00\x00\x00\x00\x00\x01\x01\x01\x01\x01\x01\x01\x01", 0xff00, 16, swapped=True)
+    d = BitStruct(
+        "a" / BitsInteger(3),
+        "b" / BitsInteger(11, reversed=True),
+        "c" / BitsInteger(2),
+    )
+    wire = bytes([0b10110010, 0b01001111])
+    assert d.parse(wire) == Container(a=5, b=1609, c=3)
+    assert d.build(Container(a=5, b=1609, c=3)) == wire
+    assert d.sizeof() == 2
+    compiled = d.compile()
+    assert compiled.parse(wire) == Container(a=5, b=1609, c=3)
+    assert compiled.build(Container(a=5, b=1609, c=3)) == wire
+    assert compiled.sizeof() == 2
+    assert d.build(Container(a=0, b=0, c=3)) == bytes([0b00000000, 0b00000011])
+    signed = BitStruct("value" / BitsInteger(11, signed=True, reversed=True), Padding(5))
+    signed_wire = bytes([0b01111111, 0b11100000])
+    assert signed.parse(signed_wire).value == -2
+    assert signed.build(Container(value=-2)) == signed_wire
+    assert signed.sizeof() == 2
+    compiled_signed = signed.compile()
+    assert compiled_signed.parse(signed_wire).value == -2
+    assert compiled_signed.build(Container(value=-2)) == signed_wire
+    assert raises(signed.build, Container(value=-1025)) == IntegerError
+    assert raises(signed.build, Container(value=1024)) == IntegerError
+    d = BitsInteger(11, reversed=this.reversed)
+    common(d, b"\x00\x01\x00\x01\x00\x00\x00\x00\x01\x00\x00", 644, 11, reversed=False)
+    common(d, b"\x00\x00\x01\x00\x00\x00\x00\x01\x00\x01\x00", 644, 11, reversed=True)
+    d = BitsInteger(11, reversed=True).compile()
+    assert d.parse(b"\x00\x00\x01\x00\x00\x00\x00\x01\x00\x01\x00") == 644
+    assert d.build(644) == b"\x00\x00\x01\x00\x00\x00\x00\x01\x00\x01\x00"
+    assert d.sizeof() == 11
     assert raises(BitsInteger(-1).parse, b"") == IntegerError
     assert raises(BitsInteger(-1).build, 0) == IntegerError
     assert raises(BitsInteger(5, swapped=True).parse, bytes(5)) == IntegerError
     assert raises(BitsInteger(5, swapped=True).build, 0) == IntegerError
+    assert raises(BitsInteger(11, swapped=True).parse, bytes(11)) == IntegerError
     assert raises(BitsInteger(8).build, None) == IntegerError
     assert raises(BitsInteger(8, signed=False).build, -1) == IntegerError
     assert raises(BitsInteger(8, True).build,  -2**64) == IntegerError

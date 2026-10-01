@@ -75,6 +75,12 @@ def test_swapbytesinbits():
     assert swapbytesinbits(b"0000000011111111") == b"1111111100000000"
     assert raises(swapbytesinbits, b"1") == ValueError
 
+def test_swapbits():
+    assert swapbits(b"") == b""
+    assert swapbits(b"\x00\x00\x00\x01\x00\x00\x01\x01") == b"\x01\x01\x00\x00\x01\x00\x00\x00"
+    assert swapbits(b"\x01\x00\x01") == b"\x01\x00\x01"
+    assert swapbits(b"\x01\x00\x00") == b"\x00\x00\x01"
+
 def test_swapbitsinbytes():
     assert swapbitsinbytes(b"") == b""
     assert swapbitsinbytes(b"\xf0") == b"\x0f"

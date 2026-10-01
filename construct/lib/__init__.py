@@ -35,6 +35,7 @@ __all__ = [
     'setGlobalPrintFullStrings',
     'setGlobalPrintPrivateEntries',
     'str2bytes',
+    'swapbits',
     'swapbitsinbytes',
     'swapbytes',
     'swapbytesinbits',

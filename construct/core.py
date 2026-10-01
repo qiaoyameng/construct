@@ -1031,11 +1031,14 @@ def Bitwise(subcon):
     r"""
     Converts the stream from bytes to bits, and passes the bitstream to underlying subcon. Bitstream is a stream that contains 8 times as many bytes, and each byte is either \\x00 or \\x01 (in documentation those bytes are called bits).
 
-    Parsing building and size are deferred to subcon, although size gets divided by 8 (therefore the subcon's size must be a multiple of 8).
+    Parsing building and size are deferred to subcon, although size gets
+    divided by 8. The subcon therefore must consume or produce a multiple of 8
+    bits; individual fields inside it may cross byte boundaries, but the outer
+    boundary is byte aligned.
     
     Note that by default the bit ordering is from MSB to LSB for every byte (ie. bit-level big-endian). If you need it reversed, wrap this subcon with :class:`construct.core.BitsSwapped`.
 
-    :param subcon: Construct instance, any field that works with bits (like BitsInteger) or is bit-byte agnostic (like Struct or Flag)
+    :param subcon: Construct instance, a field that works with bits (like BitsInteger) or is bit-byte agnostic (like Struct or Flag); do not nest another Bitwise directly inside this context
 
     See :class:`~construct.core.Transformed` and :class:`~construct.core.Restreamed` for raisable exceptions.
 
@@ -1066,6 +1069,30 @@ def Bitwise(subcon):
         macro = Transformed(subcon, bytes2bits, size//8, bits2bytes, size//8)
     except SizeofError:
         macro = Restreamed(subcon, bytes2bits, 1, bits2bytes, 8, lambda n: n//8)
+    parse = macro._parse
+    build = macro._build
+
+    def _parse(stream, context, path):
+        try:
+            return parse(stream, context, path)
+        except ValueError as e:
+            raise StreamError(str(e), path=path)
+
+    def _build(obj, stream, context, path):
+        try:
+            return build(obj, stream, context, path)
+        except ValueError as e:
+            raise StreamError(str(e), path=path)
+
+    def _sizeof(context, path):
+        size = subcon._sizeof(context, path)
+        if size % 8:
+            raise SizeofError(f"bit size {size} is not byte-aligned", path=path)
+        return size // 8
+
+    macro._parse = _parse
+    macro._build = _build
+    macro._sizeof = _sizeof
     def _emitseq(ksy, bitwise):
         return subcon._compileseq(ksy, bitwise=True)
     def _emitprimitivetype(ksy, bitwise):
@@ -1080,11 +1107,15 @@ def Bitwise(subcon):
 
 def Bytewise(subcon):
     r"""
-    Converts the bitstream back to normal byte stream. Must be used within :class:`~construct.core.Bitwise`.
+    Converts the bitstream back to a normal byte stream. Must be used within
+    :class:`~construct.core.Bitwise`. The wrapped byte-oriented construct must
+    consume or produce whole bytes, although those bytes need not be aligned
+    with the enclosing byte boundary.
 
-    Parsing building and size are deferred to subcon, although size gets multiplied by 8.
+    Parsing building and size are deferred to subcon, although size gets
+    multiplied by 8. Do not use this wrapper outside a Bitwise context.
 
-    :param subcon: Construct instance, any field that works with bytes or is bit-byte agnostic
+    :param subcon: Construct instance, a byte-oriented field or a bit-byte agnostic field
 
     See :class:`~construct.core.Transformed` and :class:`~construct.core.Restreamed` for raisable exceptions.
 
@@ -1296,24 +1327,32 @@ class BitsInteger(Construct):
     r"""
     Field that packs arbitrarily large (or small) integers. Some fields (Bit Nibble Octet) use this class. Must be enclosed in :class:`~construct.core.Bitwise` context.
 
-    Parses into an integer. Builds from an integer into specified bit count and endianness. Size (in bits) is specified in ctor.
+    Parses into an integer. Builds from an integer into specified bit count and ordering. Size (in bits) is specified in ctor.
 
     Analog to :class:`~construct.core.BytesInteger` which operates on bytes. In fact::
 
         BytesInteger(n) <--> Bitwise(BitsInteger(8*n))
         BitsInteger(8*n) <--> Bytewise(BytesInteger(n))
 
-    Note that little-endianness is only defined for multiples of 8 bits.
+    Byte ordering and bit ordering are independent. The `swapped` parameter
+    reverses chunks of eight bits (bytes) and is only defined for lengths that
+    are a multiple of 8. The `reversed` parameter reverses the complete
+    bit-string of this integer and is defined for arbitrary field widths. In
+    particular, use ``reversed=True`` rather than ``swapped=True`` for an
+    11-bit LSB-first field.
 
     Byte ordering (i.e. `swapped` parameter) refers to bytes (chunks of 8 bits) so, for example::
 
         BytesInteger(n, swapped=True) <--> Bitwise(BitsInteger(8*n, swapped=True))
 
-    Swapped argument was recently fixed. To obtain previous (faulty) behavior, you can use `ByteSwapped`, `BitsSwapped` and `Bitwise` in whatever particular order (see examples).
+    To reverse every bit in every underlying byte of a larger bit stream, use
+    :class:`BitsSwapped`. Field-level ``reversed=True`` instead reverses only
+    the bits belonging to one integer and leaves adjacent bit fields untouched.
 
     :param length: integer or context lambda, number of bits in the field
     :param signed: bool, whether the value is signed (two's complement), default is False (unsigned)
     :param swapped: bool or context lambda, whether to swap byte order (little endian), default is False (big endian)
+    :param reversed: bool or context lambda, whether the field is LSB-first instead of MSB-first, default is False
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
     :raises IntegerError: length is negative or zero
@@ -1335,31 +1374,32 @@ class BitsInteger(Construct):
 
     Obtaining other byte or bit orderings::
 
-        >>> d = BitsInteger(2)
-        >>> d.parse(b'\x01\x00') # Bit-Level Big-Endian
-        2
-        >>> d = ByteSwapped(BitsInteger(2))
-        >>> d.parse(b'\x01\x00') # Bit-Level Little-Endian
-        1
+        >>> d = BitStruct("value" / BitsInteger(2), Padding(6))
+        >>> d.parse(b"\x80") # 10, MSB-first
+        Container(value=2)
+        >>> d = BitStruct("value" / BitsInteger(2, reversed=True), Padding(6))
+        >>> d.parse(b"\x40") # 01, LSB-first
+        Container(value=2)
         >>> d = BitsInteger(16) # Byte-Level Big-Endian, Bit-Level Big-Endian
-        >>> d.build(5 + 19*256)
-        b'\x00\x00\x00\x01\x00\x00\x01\x01\x00\x00\x00\x00\x00\x01\x00\x01'
+        >>> Bitwise(d).build(5 + 19*256).hex()
+        '1305'
         >>> d = BitsInteger(16, swapped=True) # Byte-Level Little-Endian, Bit-Level Big-Endian
-        >>> d.build(5 + 19*256)
-        b'\x00\x00\x00\x00\x00\x01\x00\x01\x00\x00\x00\x01\x00\x00\x01\x01'
-        >>> d = ByteSwapped(BitsInteger(16)) # Byte-Level Little-Endian, Bit-Level Little-Endian
-        >>> d.build(5 + 19*256)
-        b'\x01\x00\x01\x00\x00\x00\x00\x00\x01\x01\x00\x00\x01\x00\x00\x00'
-        >>> d = ByteSwapped(BitsInteger(16, swapped=True)) # Byte-Level Big-Endian, Bit-Level Little-Endian
-        >>> d.build(5 + 19*256)
-        b'\x01\x01\x00\x00\x01\x00\x00\x00\x01\x00\x01\x00\x00\x00\x00\x00'
+        >>> Bitwise(d).build(5 + 19*256).hex()
+        '0513'
+        >>> d = BitsInteger(16, reversed=True) # Byte-Level Big-Endian, Bit-Level Little-Endian
+        >>> Bitwise(d).build(5 + 19*256).hex()
+        'a0c8'
+        >>> d = BitsInteger(16, swapped=True, reversed=True) # Byte-Level Little-Endian, Bit-Level Little-Endian
+        >>> Bitwise(d).build(5 + 19*256).hex()
+        'c8a0'
     """
 
-    def __init__(self, length, signed=False, swapped=False):
+    def __init__(self, length, signed=False, swapped=False, reversed=False):
         super().__init__()
         self.length = length
         self.signed = signed
         self.swapped = swapped
+        self.reversed = reversed
 
     def _parse(self, stream, context, path):
         length = evaluate(self.length, context)
@@ -1369,6 +1409,8 @@ class BitsInteger(Construct):
         try:
             if evaluate(self.swapped, context):
                 data = swapbytesinbits(data)
+            if evaluate(self.reversed, context):
+                data = swapbits(data)
             return bits2integer(data, self.signed)
         except ValueError as e:
             raise IntegerError(str(e), path=path)
@@ -1383,6 +1425,8 @@ class BitsInteger(Construct):
             data = integer2bits(obj, length, self.signed)
             if evaluate(self.swapped, context):
                 data = swapbytesinbits(data)
+            if evaluate(self.reversed, context):
+                data = swapbits(data)
         except ValueError as e:
             raise IntegerError(str(e), path=path)
         stream_write(stream, data, length, path)
@@ -1395,14 +1439,19 @@ class BitsInteger(Construct):
             raise SizeofError("cannot calculate size, key not found in context", path=path)
 
     def _emitparse(self, code):
-        return f"bits2integer(swapbytesinbits(io.read({self.length})) if {self.swapped} else io.read({self.length}), {self.signed})"
+        bits = f"swapbytesinbits(io.read({self.length})) if {self.swapped} else io.read({self.length})"
+        bits = f"swapbits({bits}) if {self.reversed} else {bits}"
+        return f"bits2integer({bits}, {self.signed})"
 
     def _emitbuild(self, code):
-        return f"((io.write(swapbytesinbits(integer2bits(obj, {self.length}, {self.signed})) if ({self.swapped}) else integer2bits(obj, {self.length}, {self.signed}))), obj)[1]"
+        bits = f"swapbytesinbits(integer2bits(obj, {self.length}, {self.signed})) if ({self.swapped}) else integer2bits(obj, {self.length}, {self.signed})"
+        bits = f"swapbits({bits}) if ({self.reversed}) else {bits}"
+        return f"((io.write({bits})), obj)[1]"
 
     def _emitprimitivetype(self, ksy, bitwise):
         assert not self.signed
         assert not self.swapped
+        assert not self.reversed
         return "b%s" % (self.length, )
 
 

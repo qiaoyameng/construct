@@ -146,6 +146,21 @@ def swapbytesinbits(data):
     return b"".join(data[i:i+8] for i in reversed(range(0,len(data),8)))
 
 
+def swapbits(data):
+    r"""
+    Reverses the order of bits in a bit-string.
+
+    Unlike :func:`swapbytesinbits`, this operation is defined for arbitrary
+    bit lengths and does not treat the data as chunks of bytes.
+
+    Example:
+
+        >>> swapbits(b"\x00\x00\x00\x01\x00\x00\x01\x01")
+        b'\x01\x01\x00\x00\x01\x00\x00\x00'
+    """
+    return data[::-1]
+
+
 SWAPBITSINBYTES_CACHE = {i:byte2int(bits2bytes(swapbytes(bytes2bits(int2byte(i))))) for i in range(256)}
 def swapbitsinbytes(data):
     r"""
